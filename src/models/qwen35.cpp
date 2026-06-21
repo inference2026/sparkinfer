@@ -41,6 +41,7 @@ struct Qwen35Model::Impl {
     cudaStream_t stream{};
     uint64_t seq_id = 0;
     int qdim, kvdim;
+    bool gguf = false;   // true after load_gguf: dense weights are native [out,in], use GEMV
 
     // scratch (bf16)
     bf16 *x, *xn, *q, *k, *v, *attn, *ao, *h, *hn, *routed, *shared;
@@ -111,9 +112,15 @@ int Qwen35Model::forward_token(int token_id, int position) {
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
         kernels::launch_rmsnorm(s.x, w.input_norm, s.xn, 1, H, c.rms_eps, st);
-        kernels::launch_gemm(s.xn, w.wq, s.q, 1, s.qdim,  H, 1.f, 0.f, gc, st);
-        kernels::launch_gemm(s.xn, w.wk, s.k, 1, s.kvdim, H, 1.f, 0.f, gc, st);
-        kernels::launch_gemm(s.xn, w.wv, s.v, 1, s.kvdim, H, 1.f, 0.f, gc, st);
+        if (s.gguf) {   // GGUF dense weights are native [out,in] -> coalesced GEMV
+            kernels::launch_gemv(s.xn, w.wq, s.q, s.qdim,  H, st);
+            kernels::launch_gemv(s.xn, w.wk, s.k, s.kvdim, H, st);
+            kernels::launch_gemv(s.xn, w.wv, s.v, s.kvdim, H, st);
+        } else {
+            kernels::launch_gemm(s.xn, w.wq, s.q, 1, s.qdim,  H, 1.f, 0.f, gc, st);
+            kernels::launch_gemm(s.xn, w.wk, s.k, 1, s.kvdim, H, 1.f, 0.f, gc, st);
+            kernels::launch_gemm(s.xn, w.wv, s.v, 1, s.kvdim, H, 1.f, 0.f, gc, st);
+        }
         // per-head QK-norm (rows = heads, cols = head_dim)
         kernels::launch_rmsnorm(s.q, w.q_norm, s.q, c.n_q_heads,  c.head_dim, c.rms_eps, st);
         kernels::launch_rmsnorm(s.k, w.k_norm, s.k, c.n_kv_heads, c.head_dim, c.rms_eps, st);
@@ -127,12 +134,16 @@ int Qwen35Model::forward_token(int token_id, int position) {
                                           1, c.n_kv_heads, c.head_dim, s.kv->block_size(),
                                           s.kv->max_blocks_per_seq(), 1.f / sqrtf((float)c.head_dim), st);
 
-        kernels::launch_gemm(s.attn, w.wo, s.ao, 1, H, s.qdim, 1.f, 0.f, gc, st);
+        if (s.gguf) kernels::launch_gemv(s.attn, w.wo, s.ao, H, s.qdim, st);
+        else        kernels::launch_gemm(s.attn, w.wo, s.ao, 1, H, s.qdim, 1.f, 0.f, gc, st);
         launch_residual_add(s.x, s.ao, s.h, H, st);
         kernels::launch_rmsnorm(s.h, w.post_attn_norm, s.hn, 1, H, c.rms_eps, st);
 
+#ifdef SPARKINFER_SKIP_MOE
+        cudaMemsetAsync(s.routed, 0, (size_t)num_seqs * H * sizeof(bf16), st);  // ablation: isolate MoE cost
+#else
         if (w.gate_q) {   // GGUF fused: route, then dequant-on-read only the top_k experts
-            kernels::launch_moe_router_gemm(s.hn, w.router_w, s.mf_logits, 1, c.hidden, c.n_experts, st);
+            kernels::launch_gemv_f32(s.hn, w.router_w, s.mf_logits, c.n_experts, c.hidden, st);  // router_w native [E,H]
             cu(cudaMemsetAsync(s.mf_counts, 0, c.n_experts * sizeof(int), st), "mf counts");
             kernels::launch_moe_router(s.mf_logits, s.mf_ids, s.mf_weights, s.mf_counts,
                                        1, c.n_experts, c.top_k, 1, st);
@@ -144,6 +155,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
             s.engine->set_layer_weights(L, {w.router_w, w.gate, w.up, w.down});
             s.engine->forward(s.hn, s.routed, 1, L, st);
         }
+#endif
         if (c.n_shared > 0) {
             kernels::launch_moe_expert_ffn(s.hn, w.shared_gate, w.shared_up, w.shared_down,
                                            s.d_shared_ids, s.d_shared_w, s.shared,
@@ -154,7 +166,8 @@ int Qwen35Model::forward_token(int token_id, int position) {
     }
 
     kernels::launch_rmsnorm(s.x, s.w.final_norm, s.xn, 1, H, c.rms_eps, st);
-    kernels::launch_linear_f32(s.xn, s.w.lm_head, s.logits, 1, c.vocab, H, st);
+    if (s.gguf) kernels::launch_gemv_f32(s.xn, s.w.lm_head, s.logits, c.vocab, H, st);  // lm_head native [vocab,H]
+    else        kernels::launch_linear_f32(s.xn, s.w.lm_head, s.logits, 1, c.vocab, H, st);
     kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
 
     int out_id = 0;
@@ -242,6 +255,7 @@ bool Qwen35Model::load_weights(const std::string& dir) {
 bool Qwen35Model::load_gguf(const std::string& path) {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
+    s.gguf = true;   // dense weights kept native [out,in]; forward uses GEMV
     GGUF g;
     if (!g.open(path)) return false;
 
@@ -282,7 +296,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     s.w.embed_tokens = dense("token_embd.weight", false);     // [vocab,hidden] as-is
     s.w.final_norm   = dense("output_norm.weight", false);
     const char* lm = g.tensor("output.weight") ? "output.weight" : "token_embd.weight";  // tied fallback
-    s.w.lm_head = dense(lm, true);                             // [vocab,hidden] -> [hidden,vocab]
+    s.w.lm_head = dense(lm, false);                            // native [vocab,hidden] for GEMV
     if (!s.w.embed_tokens || !s.w.final_norm || !s.w.lm_head) return false;
 
     s.w.layers.resize(c.n_layers);
@@ -290,11 +304,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         std::string b = "blk." + std::to_string(i) + ".";
         Qwen35LayerWeights& w = s.w.layers[i];
         w.input_norm = dense(b + "attn_norm.weight", false);
-        w.wq = dense(b + "attn_q.weight", true); w.wk = dense(b + "attn_k.weight", true);
-        w.wv = dense(b + "attn_v.weight", true); w.wo = dense(b + "attn_output.weight", true);
+        w.wq = dense(b + "attn_q.weight", false); w.wk = dense(b + "attn_k.weight", false);
+        w.wv = dense(b + "attn_v.weight", false); w.wo = dense(b + "attn_output.weight", false);
         w.q_norm = dense(b + "attn_q_norm.weight", false); w.k_norm = dense(b + "attn_k_norm.weight", false);
         w.post_attn_norm = dense(b + "ffn_norm.weight", false);
-        w.router_w = dense(b + "ffn_gate_inp.weight", true);   // [E,H] -> [H,E]
+        w.router_w = dense(b + "ffn_gate_inp.weight", false);   // native [E,H] for GEMV
         w.gate_q = dev_quant(b + "ffn_gate_exps.weight", w.gate_qtype);   // kept quantized
         w.up_q   = dev_quant(b + "ffn_up_exps.weight",   w.up_qtype);
         w.down_q = dev_quant(b + "ffn_down_exps.weight", w.down_qtype);
