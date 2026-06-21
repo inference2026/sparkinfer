@@ -129,6 +129,9 @@ int Qwen35Model::forward_token(int token_id, int position) {
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
         kernels::launch_rmsnorm(s.x, w.input_norm, s.xn, 1, H, c.rms_eps, st);
+#ifdef SPARKINFER_SKIP_ATTN
+        cudaMemcpyAsync(s.h, s.x, (size_t)H * sizeof(bf16), cudaMemcpyDeviceToDevice, st);  // ablation
+#else
         if (s.gguf) {   // GGUF dense weights are native [out,in] -> coalesced GEMV
             kernels::launch_gemv(s.xn, w.wq, s.q, s.qdim,  H, st);
             kernels::launch_gemv(s.xn, w.wk, s.k, s.kvdim, H, st);
@@ -147,13 +150,18 @@ int Qwen35Model::forward_token(int token_id, int position) {
         bf16* vpool = (bf16*)s.kv->v_pool() + (size_t)L * s.kv->layer_stride_elems();
         launch_kv_append(kpool, vpool, s.k, s.v, btable, s.d_writepos, 1,
                          c.n_kv_heads, c.head_dim, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+#ifdef SPARKINFER_SKIP_GQA
+        cudaMemsetAsync(s.attn, 0, (size_t)s.qdim * sizeof(bf16), st);  // ablation: isolate gqa kernel
+#else
         kernels::launch_flash_decode_gqa8(s.q, kpool, vpool, btable, s.d_seqlen, s.attn,
                                           1, c.n_kv_heads, c.head_dim, s.kv->block_size(),
                                           s.kv->max_blocks_per_seq(), 1.f / sqrtf((float)c.head_dim), st);
+#endif
 
         if (s.gguf) kernels::launch_gemv(s.attn, w.wo, s.ao, H, s.qdim, st);
         else        kernels::launch_gemm(s.attn, w.wo, s.ao, 1, H, s.qdim, 1.f, 0.f, gc, st);
         launch_residual_add(s.x, s.ao, s.h, H, st);
+#endif
         kernels::launch_rmsnorm(s.h, w.post_attn_norm, s.hn, 1, H, c.rms_eps, st);
 
 #ifdef SPARKINFER_SKIP_MOE
