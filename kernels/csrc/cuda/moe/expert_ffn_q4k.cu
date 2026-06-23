@@ -227,6 +227,45 @@ __global__ void down_q6k_kernel(
     if (lane == 0) output[(size_t)token * H + hh] = __float2bfloat16(acc);
 }
 
+// split-K down: S warps cooperate per output row hh (each does a stride of the
+// top_k*Fblocks work, then the S partials are summed in shared). At bs=1 the plain
+// one-warp-per-row down has only H rows = H warps -> ~19% occupancy; this puts S*H
+// warps in flight to hide latency. Accuracy-safe: same fp math, only the reduction
+// order changes. ncu said decode is occupancy-bound — this is the measured lever.
+__global__ void down_q6k_splitk_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const float* __restrict__ h_scratch,
+    __nv_bfloat16* __restrict__ output, int H, int F, int top_k, int down_type
+) {
+    constexpr int S = 4, RPB = WPB / S;     // splits per row, rows per block
+    __shared__ float s_part[RPB][S];
+    const int token = blockIdx.x, lane = threadIdx.x & 31, warpId = threadIdx.x >> 5;
+    const int hh_local = warpId / S, split = warpId % S;
+    const int hh = blockIdx.y * RPB + hh_local;
+    const int nblk = F >> 8, dbb = q_block_bytes(down_type);
+    float acc = 0.f;
+    if (hh < H) {
+        const int total = top_k * nblk;
+        for (int wi = split; wi < total; wi += S) {
+            const int j = wi / nblk, blk = wi % nblk;
+            const int ts = token * top_k + j, e = expert_ids[ts];
+            const float w = expert_weights[ts];
+            const unsigned char* drow = down_q + ((size_t)e * H + hh) * nblk * dbb;
+            acc += w * q4kf_deq_dot(down_type, drow + (size_t)blk * dbb,
+                                    h_scratch + (size_t)ts * F + blk * 256, lane);
+        }
+        acc = q4kf_wsum(acc);
+        if (lane == 0) s_part[hh_local][split] = acc;
+    }
+    __syncthreads();
+    if (hh < H && split == 0 && lane == 0) {
+        float o = 0.f;
+        #pragma unroll
+        for (int s = 0; s < S; s++) o += s_part[hh_local][s];
+        output[(size_t)token * H + hh] = __float2bfloat16(o);
+    }
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/moe.h"
 #include <cstdlib>
@@ -261,11 +300,22 @@ void launch_moe_expert_ffn_q4k(
             expert_ids, h_scratch, hidden, ffn, top_k, gate_type, up_type);
     }
 
-    dim3 dn(num_tokens, (hidden + WPB - 1) / WPB);
-    down_q6k_kernel<<<dn, WPB * 32, 0, stream>>>(
-        reinterpret_cast<const unsigned char*>(down_q),
-        expert_ids, expert_weights, h_scratch,
-        reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k, down_type);
+    static int splitk = -1;
+    if (splitk < 0) { const char* sv = getenv("SPARKINFER_SPLITK"); splitk = (sv && sv[0] == '1') ? 1 : 0; }
+    if (splitk) {   // split-K down: 4 warps/row -> 4x warps in flight (occupancy lever)
+        const int RPB = WPB / 4;
+        dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
+        down_q6k_splitk_kernel<<<dns, WPB * 32, 0, stream>>>(
+            reinterpret_cast<const unsigned char*>(down_q),
+            expert_ids, expert_weights, h_scratch,
+            reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k, down_type);
+    } else {
+        dim3 dn(num_tokens, (hidden + WPB - 1) / WPB);
+        down_q6k_kernel<<<dn, WPB * 32, 0, stream>>>(
+            reinterpret_cast<const unsigned char*>(down_q),
+            expert_ids, expert_weights, h_scratch,
+            reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k, down_type);
+    }
 }
 #endif
 
