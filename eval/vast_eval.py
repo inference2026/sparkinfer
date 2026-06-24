@@ -282,8 +282,10 @@ def main():
             print("\n!! no RESULT_JSON; stderr tail:\n" + r.stderr[-1500:])
     finally:
         # Default: STOP after every eval — pauses compute billing, keeps disk + weights for fast reuse.
-        # --destroy-on-error: if the eval produced no result, destroy instead of stop (no cached value).
-        destroy = args.destroy or (args.destroy_on_error and not got_result)
+        # --destroy-on-error only destroys if the instance itself is the problem (created fresh but no
+        # result AND it's a newly created box — reused boxes that survive setup are kept even on eval
+        # failure, since the disk cache (model + llama.cpp) is still valuable for the next run).
+        destroy = args.destroy or (args.destroy_on_error and not got_result and created)
         if args.keep:
             print(f">> leaving instance {iid} running (--keep)")
         elif destroy:
