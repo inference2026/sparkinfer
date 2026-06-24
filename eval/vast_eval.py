@@ -24,7 +24,10 @@ from vastai import VastAI
 
 REPO    = os.environ.get("EVAL_REPO",  "https://github.com/gittensor-ai-lab/sparkinfer")
 IMAGE   = os.environ.get("EVAL_IMAGE", "nvidia/cuda:12.8.0-devel-ubuntu24.04")   # needs nvcc for sm_120
-TEMPLATE_HASH = os.environ.get("EVAL_TEMPLATE_HASH", "1ea6ef1d8cc4ad95e710c4c1daed378c")  # vast template (image+cfg); set "" to use EVAL_IMAGE
+# Default to the raw CUDA image + `--ssh --direct` (proven path): template 1ea6ef1d8cc4ad95e710c4c1daed378c
+# provisions boxes that reach "running" but never expose direct SSH with our key, so wait_ssh always
+# times out (every cron run failed all 3 attempts). Set EVAL_TEMPLATE_HASH to opt back into a template.
+TEMPLATE_HASH = os.environ.get("EVAL_TEMPLATE_HASH", "")  # "" = use EVAL_IMAGE with --ssh --direct
 SSH_KEY = os.path.expanduser(os.environ.get("SSH_KEY", "~/.ssh/id_ed25519"))
 LLAMACPP_DIR = os.environ.get("LLAMACPP_DIR", "/workspace/.llamacpp")            # persists across stop/start
 INSTANCE_FILE = os.path.expanduser(os.environ.get("VAST_INSTANCE_FILE", "~/.sparkinfer_vast_instance"))  # self-healed id
