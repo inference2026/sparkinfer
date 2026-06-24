@@ -105,6 +105,17 @@ window.SPARKINFER = {
   ],
   "prs": [
     {
+      "num": 12,
+      "title": "fix(runtime): make GGUF load safe when shared-expert tensors are absent",
+      "areas": [
+        "runtime"
+      ],
+      "label": "none",
+      "tps": 184.61,
+      "delta_pct": null,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/12"
+    },
+    {
       "num": 13,
       "title": "fix(runtime/gguf): reject tensor n_dims > 4 instead of overflowing dims[4]",
       "areas": [
