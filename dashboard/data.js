@@ -105,6 +105,17 @@ window.SPARKINFER = {
   ],
   "prs": [
     {
+      "num": 9,
+      "title": "fix(runtime/gguf): reject malformed metadata arrays instead of desyncing the parse cursor",
+      "areas": [
+        "runtime"
+      ],
+      "label": "none",
+      "tps": 186.36,
+      "delta_pct": null,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/9"
+    },
+    {
       "num": 15,
       "title": "fix(runtime/qwen35): force n_shared=0 on GGUF loads without shared-expert tensors",
       "areas": [
@@ -236,17 +247,6 @@ window.SPARKINFER = {
       "tps": 184.68,
       "delta_pct": null,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/6"
-    },
-    {
-      "num": 9,
-      "title": "fix(runtime/gguf): reject malformed metadata arrays instead of desyncing the parse cursor",
-      "areas": [
-        "runtime"
-      ],
-      "label": "none",
-      "tps": 184.67,
-      "delta_pct": null,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/9"
     },
     {
       "num": 11,
