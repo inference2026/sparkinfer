@@ -27,6 +27,7 @@ The machine-readable log is [`copycats.json`](./copycats.json) — one entry per
 |------|-----------|--------|-------------|------|
 | 2026-06-25 | #14 | `glorysr1209-png` | #4 (`galuis116`) | flash_prefill mask; identical 1-line diff. Account already blocked as sybil. |
 | 2026-06-25 | #9  | `glorysr1209-png` | #6 (`galuis116`) | gguf metadata desync; 7/8 added lines identical. Account already blocked as sybil. |
+| 2026-06-25 | #54 | `kiannidev` | #53 (`James-CUDA`) | maintainer-flagged: same "default split-K down + PDL" decode change as #53 (which scored `eval:none`). Below the auto containment threshold (0.50) but a duplicate attempt — strike 1 of 2. |
 
 > `glorysr1209-png` also opened #13 and #15 (same bug-clusters as #11 / #12) but with different
 > code — not literal copies, so not logged here; they were closed under the sybil block instead.

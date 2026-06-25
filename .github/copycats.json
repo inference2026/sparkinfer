@@ -12,5 +12,12 @@
     "original": 4,
     "date": "2026-06-25",
     "note": "seed/historical; account already blocked as sybil (see FLAGGED.md)"
+  },
+  {
+    "pr": 54,
+    "author": "kiannidev",
+    "original": 53,
+    "date": "2026-06-25",
+    "note": "maintainer-flagged: same default split-K + PDL decode change as #53 (eval:none); below auto containment threshold but a duplicate attempt"
   }
 ]
