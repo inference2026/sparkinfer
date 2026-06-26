@@ -335,18 +335,23 @@ def update_dashboard(repo, pr, areas, res):
     data["prs"] = [p for p in data.get("prs", []) if p.get("num") != num]
     data["prs"].insert(0, entry)
     data["prs"] = data["prs"][:50]
-    if (res.get("pass") and res.get("label") in FRONTIER_LABELS
-            and (res.get("tps") or 0) > data["status"].get("frontier_tps", 0)):
-        data["status"]["frontier_tps"] = res["tps"]            # ratchet the live frontier
+    if res.get("pass") and res.get("label") in FRONTIER_LABELS:
+        # Scoring is now same-box (PR vs origin/main measured on the same box), so ratchet the
+        # DISPLAYED frontier by the PR's same-box RELATIVE gain (compounding) rather than its raw
+        # tok/s. That keeps the headline hardware-independent and monotonic — a real gain measured
+        # on a slower box still advances it, instead of being hidden by a faster box's old number.
+        old_f = data["status"].get("frontier_tps") or 0
+        gain = (res.get("pct_over_frontier") or 0) / 100.0
+        new_f = round(old_f * (1 + gain), 2) if old_f else round(res.get("tps") or 0, 2)
+        data["status"]["frontier_tps"] = new_f                  # ratchet the live frontier
         # Accuracy shown on the dashboard is the FRONTIER's accuracy — refresh it from the same
-        # eval that just set the frontier, so token-match/KL never go stale (they used to be a
-        # manual seed the bot never touched).
+        # eval that just set the frontier, so token-match/KL never go stale.
         if res.get("top1") is not None: data["status"]["token_match"] = round(res["top1"], 4)
         if res.get("kl") is not None:   data["status"]["kl"] = round(res["kl"], 4)
         # Record the landed optimization for the journey chart (live continuation of `passes`).
         short = re.sub(r"^\w+(\([^)]*\))?:\s*", "", pr.get("title", ""))[:28]   # strip "area(x): " prefix
         landed = [m for m in data.get("landed", []) if m.get("pr") != num]      # dedupe by PR
-        landed.append({"name": short or f"PR #{num}", "tps": round(res["tps"], 2),
+        landed.append({"name": short or f"PR #{num}", "tps": new_f,
                        "pr": num, "date": datetime.date.today().isoformat()})
         data["landed"] = sorted(landed, key=lambda m: m["tps"])
     data["updated"] = datetime.date.today().isoformat()
@@ -490,15 +495,44 @@ def main():
     if PINNED_INSTANCE:
         with open(INSTANCE_FILE, "w") as f: f.write(PINNED_INSTANCE)
 
+    # --- Same-box baseline -------------------------------------------------------------------------
+    # vast boxes vary in speed, so comparing a PR's tok/s against a frontier measured on a DIFFERENT
+    # box leaks hardware variance into the delta. Build+bench origin/main on THIS box first and grade
+    # every PR against that same-box number (+ any PR that lands earlier in this run). Measured ONCE
+    # per run, not per PR — otherwise two PRs targeting the same optimization could both "beat" main.
+    base_iid = current_instance(args.instance)
+    bcmd = [sys.executable, os.path.join(HERE, "vast_eval.py"), "--reuse", str(base_iid),
+            "--ref", "origin/main", "--frontier", "0", "--ceiling", str(args.ceiling), "--keep"]
+    if PINNED_INSTANCE and str(base_iid) == PINNED_INSTANCE: bcmd.append("--pinned")
+    print(f">> measuring same-box baseline (origin/main) on instance {base_iid} ...")
+    br = subprocess.run(bcmd, cwd=ROOT, capture_output=True, text=True, timeout=14400)
+    if br.returncode == PINNED_RETRY_RC:
+        tail = next((l for l in reversed((br.stdout + br.stderr).splitlines()) if l.strip()), "")
+        print(f">> {tail}\n>> aborting this run — next scheduled run retries the pinned box."); return
+    for l in br.stdout.splitlines():
+        if l.startswith("NEW_INSTANCE_ID "):
+            try:
+                nid = int(l.split()[1])
+                with open(INSTANCE_FILE, "w") as f: f.write(str(nid))
+                if PINNED_INSTANCE: _write_pin(nid)
+                print(f"  (instance updated to {nid}{'; re-pinned' if PINNED_INSTANCE else ''})")
+            except Exception: pass
+    bline = next((l for l in br.stdout.splitlines() if l.startswith("RESULT_JSON")), None)
+    bres = json.loads(bline[len("RESULT_JSON "):]) if bline else {}
+    if not bres.get("pass") or not bres.get("tps"):
+        log = (br.stdout + br.stderr)[-1200:]
+        print(f">> same-box baseline (origin/main) failed ({bres.get('label','no result')}) — "
+              f"aborting; no PRs graded.\n{log}"); return
+    run_baseline = bres["tps"]
+    print(f">> same-box baseline: origin/main = {run_baseline} tok/s on this box")
+
     # Run all pending evals on the SAME instance: pass --keep so vast_eval.py never stops/destroys
     # the box mid-queue. The bot stops the instance once after ALL PRs finish (or if the instance
     # dies, subsequent PRs self-heal by provisioning a new one).
     for i, (pr, num, branch, oid, ref, areas) in enumerate(pending):
-        # Re-read the frontier each iteration: a PR that passed earlier in THIS run may have
-        # ratcheted it (update_dashboard writes data.json), and later PRs must be graded against
-        # the new best — otherwise two PRs could both "beat" the same stale baseline.
-        d = load_dash()
-        cur_frontier = d["status"]["frontier_tps"] if d else frontier
+        # Grade against the same-box baseline (origin/main measured above), ratcheted by any PR that
+        # landed earlier in THIS run — so later PRs are graded against the new best, not stale main.
+        cur_frontier = run_baseline
         cur_iid = current_instance(args.instance)
         cmd = [sys.executable, os.path.join(HERE, "vast_eval.py"),
                "--reuse", str(cur_iid), "--ref", ref,
@@ -542,6 +576,8 @@ def main():
         gh(["pr", "comment", str(num), "-R", args.repo, "--body", body])
         print(f"PR #{num}: posted {'eval:'+label if label else 'error'} — NOT merged.")
         if res: update_dashboard(args.repo, pr, areas, res)
+        if res and res.get("label") in FRONTIER_LABELS and (res.get("tps") or 0) > run_baseline:
+            run_baseline = res["tps"]   # later PRs this run grade against this same-box result
 
     # Stop (not destroy) the instance after all PRs — disk/model cache persists for next run.
     final_iid = current_instance(args.instance)
