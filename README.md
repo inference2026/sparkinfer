@@ -4,7 +4,7 @@
 
 ## Proven
 
-Qwen3-30B-A3B (Q4_K_M GGUF) runs end-to-end on an RTX PRO 6000 (sm_120), decode optimized **0.60 → 134 tok/s (≈220×)** across 6 source-verifiable passes, output verified correct, **21.7 GB** resident (experts kept quantized). Independently verified on an **RTX 5090** (CUDA 13): community optimizations have ratcheted the decode frontier to **285.32 tok/s** (≈0.78× llama.cpp) at **≥96% top-1 token agreement** with llama.cpp (KL ≈ 0.14 nats) — see the live [dashboard](https://gittensor-ai-lab.github.io/sparkinfer/dashboard/), [accuracy](bench/results/accuracy_qwen3-30b-a3b_q4km.md), and [RTX 5090](bench/results/qwen3-30b-a3b_q4km_rtx5090.md) results.
+Qwen3-30B-A3B (Q4_K_M GGUF) runs end-to-end on an RTX PRO 6000 (sm_120), decode optimized **0.60 → 134 tok/s (≈220×)** across 6 source-verifiable passes, output verified correct, **21.7 GB** resident (experts kept quantized). Independently verified on an **RTX 5090** (CUDA 13): community optimizations have ratcheted the decode frontier to **313.14 tok/s** (≈0.86× llama.cpp) at **99% top-1 token agreement** with llama.cpp (KL ≈ 0.15 nats) — each PR built and benchmarked against `main` on the *same* RTX 5090 so the score is hardware-independent. See the live [dashboard](https://gittensor-ai-lab.github.io/sparkinfer/dashboard/), [accuracy](bench/results/accuracy_qwen3-30b-a3b_q4km.md), and [RTX 5090](bench/results/qwen3-30b-a3b_q4km_rtx5090.md) results.
 
 ## Why a custom engine
 

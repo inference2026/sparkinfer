@@ -3,6 +3,55 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [0.2.3] — 2026-06-26
+
+A performance jump **and** a fairer, more trustworthy evaluation: every PR is now measured against
+`main` on the **same GPU**, scored on the same-box delta, and worked through a per-round merge
+workflow that can auto-merge the winner.
+
+### Performance — RTX 5090 frontier 285.32 → 313.14 tok/s (+9.7%)
+Two verified MMVQ int8 quantized-read optimizations merged (top-1 0.99 vs llama.cpp, KL ≈ 0.15):
+- **#65** — int8 dp4a MMVQ for the Q6_K MoE down projection → 291.58 (@bohdansolovie)
+- **#70** — int8 MMVQ for the last fp32-path GEMVs (attn-V + LM head + gate/up) → 313.14 (@James-CUDA)
+
+The llama.cpp gap closed to **0.86×** (313.14 vs 365.73 tok/s).
+
+### Changed — fairer, hardware-independent scoring
+- **Same-box baseline.** Each eval builds **current `main` and the PR on the same RTX 5090** and
+  scores the **delta between them**, so speed differences between eval machines can't inflate or
+  hide a result. (Previously a PR's tok/s was compared to a frontier measured on a *different* box.)
+- **No within-run ratchet — independent PRs each score.** Every queued PR is graded against `main`,
+  not against the other PRs in the run. Before, whichever PR was graded first ratcheted the frontier
+  and made the next — a *different* optimization — look like `eval:none`.
+- **Label tiers are now bands of % over the frontier** (`XS` 2–3.5% … `XL` >18%), so all five stay
+  reachable as decode speed grows (the old fraction-of-headroom rule collapsed the small tiers).
+
+### Added — per-round merge workflow (+ guarded auto-merge)
+- A round grades the whole queue against the same `main`, labels the biggest verified speedup
+  **`merge-first`** and the rest **`needs-rebase`**. After the winner merges, rivals **rebase onto
+  the new `main`** and the bot re-evaluates them for their *marginal* gain on top — so independent
+  wins stack and an overlapping one correctly drops to `none` (`re-evaluate` tags the re-grade).
+- **Auto-merge (opt-in, heavily guarded).** The `merge-first` winner auto-merges only with a verified
+  speedup, no `copycat`/`flagged:gaming`/`penalty`/`hold`, author in good standing, changes confined
+  to `kernels`/`runtime`/`moe`, clean CI, and no conflicts. A `hold` label or `SPARKINFER_AUTOMERGE=0`
+  stops it; branch protection is still enforced.
+
+### Fixed
+- **Dashboard journey is merged-only.** The frontier and the optimization journey advance only when a
+  PR is **merged** (by its measured tok/s), not on eval — so unmerged or losing-rival evals no longer
+  pollute the chart.
+- **Self-healing eval box.** Stopped vast.ai boxes get reclaimed, so the pinned box can vanish between
+  runs; the bot now reuses it if it survived, else provisions a fresh one (Google Drive model fetch)
+  immediately and re-pins — no wasted retries.
+
+### Verified
+- **RTX 5090** frontier **313.14 tok/s**, top-1 0.99 vs llama.cpp (KL ≈ 0.15 nats), 21.4 GB resident.
+  Auto-evaluation runs on a 2-hour schedule.
+
+### Contributors
+- **@James-CUDA** — #70 (int8 MMVQ for the fp32-path GEMVs)
+- **@bohdansolovie** — #65 (int8 dp4a MMVQ for the Q6_K MoE down)
+
 ## [0.2.2] — 2026-06-26
 
 A day of rapid frontier progress (**+52% decode**), a copycat caught gaming the eval, and a
