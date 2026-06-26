@@ -41,7 +41,9 @@ must be clean (0 errors).
 ## How rewards work (SN74)
 
 **Speedup-only.** You're paid for the **verified marginal speedup** your PR adds over the
-current best ("frontier"), not your rank — so "copy the leader + ε" pays ≈ ε. The eval loop
+current best ("frontier"), not your rank — so "copy the leader + ε" pays ≈ ε. Both **current
+`main` and your PR are built and benchmarked on the same RTX 5090** in one run and scored on the
+delta between them, so speed differences between eval machines can't inflate or hide your result. The eval loop
 labels each PR **XL / L / M / S / XS** from the measured delta (or **BASELINE** for the first
 verified entry on a new model/target) — never by hand — and that tier is the payout. A speedup
 is scored the same wherever it lands (`kernels/`, `runtime/`, `moe/`); there is **no
