@@ -83,6 +83,20 @@ window.SPARKINFER = {
   ],
   "prs": [
     {
+      "num": 76,
+      "title": "perf(attn): fuse per-head Q/K-norm and Q/K rope into single kernels (+4.1% decode)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "S",
+      "tps": 371.27,
+      "delta_pct": 4.4,
+      "top1": 0.98,
+      "kl": 0.1453,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/76"
+    },
+    {
       "num": 73,
       "title": "perf(moe): skip the unused per-expert token count in single-token decode (+6% decode)",
       "areas": [
@@ -107,20 +121,6 @@ window.SPARKINFER = {
       "top1": 0.99,
       "kl": 0.1417,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/72"
-    },
-    {
-      "num": 76,
-      "title": "perf(attn): fuse per-head Q/K-norm and Q/K rope into single kernels (+4.1% decode)",
-      "areas": [
-        "kernels",
-        "runtime"
-      ],
-      "label": "none",
-      "tps": 345.47,
-      "delta_pct": -0.7,
-      "top1": 0.98,
-      "kl": 0.158,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/76"
     },
     {
       "num": 67,
