@@ -82,6 +82,19 @@
   ],
   "prs": [
     {
+      "num": 74,
+      "title": "perf(moe): split-K MMVQ down — +8% Qwen3-MoE decode on RTX 5090",
+      "areas": [
+        "kernels"
+      ],
+      "label": "S",
+      "tps": 339.59,
+      "delta_pct": 5.9,
+      "top1": 0.95,
+      "kl": 0.1415,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/74"
+    },
+    {
       "num": 73,
       "title": "perf(moe): skip the unused per-expert token count in single-token decode (+6% decode)",
       "areas": [
