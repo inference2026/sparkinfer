@@ -403,9 +403,16 @@ int Qwen35Model::forward_token(int token_id, int position) {
     return *s.h_out_id;
 }
 
-double Qwen35Model::bench_decode(int warmup, int n) {
+double Qwen35Model::bench_decode(int warmup, int n, int context_tokens) {
     Impl& s = *p_;
     if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) { fprintf(stderr, "[bench] kv allocate failed\n"); return -1; }
+    if (context_tokens < 0) context_tokens = 0;
+    if (context_tokens + warmup + n > s.cfg.max_seq) {
+        fprintf(stderr, "[bench] requested ctx=%d warmup=%d n=%d exceeds max_seq=%d\n",
+                context_tokens, warmup, n, s.cfg.max_seq);
+        s.kv->free(s.seq_id);
+        return -1;
+    }
     static int bench_device_loop = -1;
     if (bench_device_loop < 0) {
         const char* e = getenv("SPARKINFER_BENCH_DEVICE_LOOP");
@@ -413,6 +420,7 @@ double Qwen35Model::bench_decode(int warmup, int n) {
     }
     s.bench_feedback_graph = bench_device_loop != 0;
     int pos = 0, tok = 100;
+    for (int i = 0; i < context_tokens; i++) { tok = forward_token(tok, pos++); if (tok < 0 || tok >= s.cfg.vocab) tok = 100; }
     for (int i = 0; i < warmup; i++) { tok = forward_token(tok, pos++); if (tok < 0 || tok >= s.cfg.vocab) tok = 100; }
     if (s.graph_ready) cu(cudaGraphUpload(s.cu_exec, s.stream), "bench graph upload");
     cudaDeviceSynchronize();
