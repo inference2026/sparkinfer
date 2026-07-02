@@ -927,6 +927,16 @@ window.SPARKINFER = {
   ],
   "landed_longctx": [
     {
+      "name": "fixed split before v0.3.3",
+      "tps": 70.8,
+      "pr": 115,
+      "ctx": 16384,
+      "date": "2026-06-30",
+      "release": "pre-v0.3.3",
+      "author": "ai-hpc",
+      "fixed_baseline": true
+    },
+    {
       "name": "v0.3.3 adaptive split POC",
       "tps": 166.2,
       "pr": 115,
