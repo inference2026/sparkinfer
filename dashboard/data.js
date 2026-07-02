@@ -114,6 +114,28 @@ window.SPARKINFER = {
   ],
   "prs": [
     {
+      "num": 128,
+      "title": "perf(gemv): specialize q4 mmvq common K",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "XS",
+      "tps": 259.6,
+      "delta_pct": 3.0,
+      "top1": 0.9795,
+      "kl": 0.0116,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/128",
+      "eval_mode": "longctx",
+      "score_context": 16384,
+      "ctx_2048_tps": 279.71,
+      "ctx_16384_tps": 259.6,
+      "guard_2k_baseline": 277.78,
+      "guard_2k_ratio": 1.0069,
+      "guard_2k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0128-c7f9ba8"
+    },
+    {
       "num": 125,
       "title": "perf(attn): bf16 GQA smem tile + scale combine warps at 256 splits",
       "areas": [
@@ -775,17 +797,6 @@ window.SPARKINFER = {
       "tps": 186.29,
       "delta_pct": null,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/23"
-    },
-    {
-      "num": 26,
-      "title": "runtime/gguf: clamp invalid general.alignment to default (fix divide-by-zero)",
-      "areas": [
-        "runtime"
-      ],
-      "label": "none",
-      "tps": 186.41,
-      "delta_pct": null,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/26"
     }
   ],
   "landed": [
