@@ -23,7 +23,7 @@ window.SPARKINFER = {
       "color": "#7B5DFF",
       "tokens": 128,
       "sparkinfer_tps": 402.39,
-      "llamacpp_tg128_tps": 362.76
+      "llamacpp_note": "pending llama-batched-bench decode-at-context remeasure"
     },
     {
       "ctx": 4096,
@@ -31,7 +31,7 @@ window.SPARKINFER = {
       "color": "#0E8A16",
       "tokens": 128,
       "sparkinfer_tps": 193.83,
-      "llamacpp_tg128_tps": 362.62
+      "llamacpp_note": "pending llama-batched-bench decode-at-context remeasure"
     },
     {
       "ctx": 16384,
@@ -39,7 +39,7 @@ window.SPARKINFER = {
       "color": "#B8860B",
       "tokens": 128,
       "sparkinfer_tps": 167.89,
-      "llamacpp_tg128_tps": 362.61
+      "llamacpp_note": "pending llama-batched-bench decode-at-context remeasure"
     }
   ],
   "passes_gpu": "RTX 5090",
