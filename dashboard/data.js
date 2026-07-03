@@ -128,6 +128,47 @@ window.SPARKINFER = {
   ],
   "prs": [
     {
+      "num": 139,
+      "title": "perf(decode): O-proj pack2 MMVQ + context-aware GQA flash tile (~3% e2e)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "REJECT",
+      "tps": 488.0,
+      "delta_pct": null,
+      "top1": 0.2408,
+      "kl": 5.0271,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/139",
+      "eval_mode": "longctx",
+      "score_context": 512,
+      "best_context_label": "512-context",
+      "context_gains_pct": {
+        "128-context": 3.38,
+        "512-context": 3.66,
+        "4k-context": 2.56,
+        "16k-context": 1.1
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 512.24,
+      "ctx_512_tps": 488.0,
+      "ctx_4096_tps": 403.72,
+      "ctx_16384_tps": 268.72,
+      "guard_128_baseline": 495.49,
+      "guard_128_ratio": 1.0338,
+      "guard_128_pass": true,
+      "guard_512_baseline": 470.76,
+      "guard_512_ratio": 1.0366,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 393.65,
+      "guard_4k_ratio": 1.0256,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 265.79,
+      "guard_16k_ratio": 1.011,
+      "guard_16k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0139-1766b32"
+    },
+    {
       "num": 137,
       "title": "perf(decode): occupancy-first n_splits schedule (+8.8% @ 4k over #136)",
       "areas": [
@@ -910,17 +951,6 @@ window.SPARKINFER = {
       "tps": 186.28,
       "delta_pct": null,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/15"
-    },
-    {
-      "num": 17,
-      "title": "kernels/quant: reject unsupported GGUF types instead of silently decoding as F32",
-      "areas": [
-        "kernels"
-      ],
-      "label": "REJECT",
-      "tps": 0,
-      "delta_pct": null,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/17"
     }
   ],
   "landed": [
