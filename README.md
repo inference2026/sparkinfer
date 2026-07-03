@@ -58,9 +58,9 @@ This keeps rewards tied to marginal speed on shipped code, not claims in a PR de
 
 Most LLM inference engines were built for datacenter GPUs and cloud AI. On consumer GPUs they can be
 hard to install, power-hungry, thermally awkward, and slow to adapt to new SOTA models or algorithms
-because the codebases are large and maintenance-heavy. SPARKINFER is designed for next-generation
-personal agents on devices like [NVIDIA RTX Spark](https://www.nvidia.com/en-us/products/rtx-spark/),
-with up to 1 Petaflop FP4 AI performance.
+because the codebases are large and maintenance-heavy. **SPARKINFER** is designed for next-generation
+personal agents on devices like [**NVIDIA RTX Spark**](https://www.nvidia.com/en-us/products/rtx-spark/),
+with up to **1 Petaflop** FP4 AI performance.
 
 SPARKINFER solves this for local Blackwell AI:
 
