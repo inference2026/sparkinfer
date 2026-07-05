@@ -772,6 +772,8 @@ def main():
         "512": float(os.environ.get("SPARKINFER_QWEN36_512", "23.16")),
         "4k":  float(os.environ.get("SPARKINFER_QWEN36_4K",  "23.03")),
         "llama128": float(os.environ.get("SPARKINFER_QWEN36_LLAMA_128", "190")),
+        "llama512": float(os.environ.get("SPARKINFER_QWEN36_LLAMA_512", "188")),
+        "llama4k":  float(os.environ.get("SPARKINFER_QWEN36_LLAMA_4K",  "176")),
     }
 
     dash = load_dash()
@@ -999,7 +1001,9 @@ def main():
                 "--p-guard-128-baseline", str(QWEN36_BASE["128"]),
                 "--p-guard-512-baseline", str(QWEN36_BASE["512"]),
                 "--p-guard-4k-baseline",  str(QWEN36_BASE["4k"]),
-                "--p-llama-128-baseline", str(QWEN36_BASE["llama128"])]
+                "--p-llama-128-baseline", str(QWEN36_BASE["llama128"]),
+                "--p-llama-512-baseline", str(QWEN36_BASE["llama512"]),
+                "--p-llama-4k-baseline",  str(QWEN36_BASE["llama4k"])]
         if PINNED_INSTANCE and str(cur_iid) == PINNED_INSTANCE:
             cmd.append("--pinned")  # never destroy the pin; retry-then-fallback on bring-up failure
         pinned = "--pinned" in cmd
