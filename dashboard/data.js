@@ -1671,8 +1671,8 @@ window.SPARKINFER = {
       "label": "M"
     },
     {
-      "name": "+15-20% decode — Q8 shared M",
-      "tps": 287.91,
+      "name": "fused QK-norm+RoPE+KV-append",
+      "tps": 300.16,
       "pr": 266,
       "date": "2026-07-06",
       "label": "L"
