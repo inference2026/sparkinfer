@@ -4,19 +4,19 @@ window.SPARKINFER = {
   "status": {
     "gpu": "RTX 5090 · sm_120 · CUDA 13",
     "model": "Qwen3-30B-A3B · Q4_K_M",
-    "frontier_tps": 26712.71,
+    "frontier_tps": 493.56,
     "ref_name": "llama.cpp",
     "ref_tps": 365.85,
     "vram_gb": 21.4,
-    "token_match": 0.9724,
-    "kl": 0.0108,
+    "token_match": 0.9612,
+    "kl": 0.0175,
     "ref_note": "128-tok decode rerun on current main, same RTX 5090 · Q4_K_M GGUF",
     "longctx_16k_tps": 330.2,
     "longctx_2k_tps": 277.78,
     "longctx_token_match": 0.9426,
     "longctx_kl": 0.0368,
-    "longctx_512_tps": 25143.09,
-    "longctx_4k_tps": 19741.98,
+    "longctx_512_tps": 469.58,
+    "longctx_4k_tps": 392.65,
     "longctx_32k_tps": 260.3
   },
   "context_baselines": [
@@ -25,7 +25,7 @@ window.SPARKINFER = {
       "label": "128",
       "color": "#D14D72",
       "tokens": 128,
-      "sparkinfer_tps": 26712.71,
+      "sparkinfer_tps": 493.56,
       "llamacpp_decode_tps": 365.85,
       "llamacpp_note": "128-token decode, no prefill context"
     },
@@ -34,7 +34,7 @@ window.SPARKINFER = {
       "label": "512",
       "color": "#7B5DFF",
       "tokens": 128,
-      "sparkinfer_tps": 25143.09,
+      "sparkinfer_tps": 469.58,
       "llamacpp_decode_tps": 342.59,
       "llamacpp_note": "llama-batched-bench npp=512 ntg=128 npl=1"
     },
@@ -43,7 +43,7 @@ window.SPARKINFER = {
       "label": "4k",
       "color": "#0E8A16",
       "tokens": 128,
-      "sparkinfer_tps": 19741.98,
+      "sparkinfer_tps": 392.65,
       "llamacpp_decode_tps": 292.99,
       "llamacpp_note": "llama-batched-bench npp=4096 ntg=128 npl=1"
     },
@@ -1222,18 +1222,6 @@ window.SPARKINFER = {
       "tps": 484.79,
       "pr": 122,
       "date": "2026-07-02"
-    },
-    {
-      "name": "shared expert as coalesced G",
-      "tps": 3631.12,
-      "pr": 230,
-      "date": "2026-07-05"
-    },
-    {
-      "name": "add optimized Gated-DeltaNet",
-      "tps": 26712.14,
-      "pr": 229,
-      "date": "2026-07-05"
     }
   ],
   "landed_longctx": [

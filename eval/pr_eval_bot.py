@@ -500,7 +500,8 @@ def update_dashboard(repo, pr, areas, res, proof_url=None):
              "label": res.get("label"), "tps": res.get("tps"),
              "delta_pct": res.get("pct_over_frontier"),
              "top1": res.get("top1"), "kl": res.get("kl"),
-             "url": f"https://github.com/{repo}/pull/{num}"}
+             "url": f"https://github.com/{repo}/pull/{num}",
+             "model": res.get("model", "")}
     for k in ("eval_mode", "score_context", "best_context_label", "context_gains_pct",
               "regression_labels", "auto_close",
               "ctx_128_tps", "ctx_512_tps", "ctx_2048_tps", "ctx_4096_tps",
@@ -577,6 +578,26 @@ def record_merge(repo, num):
     if data is None: return
     e = next((p for p in data.get("prs", []) if p.get("num") == num), None)
     if not e or e.get("label") not in SPEEDUP_LABELS: return                 # only verified speedups
+    # A Qwen3.6 dual-eval result must advance the Qwen3.6 frontier/journey, not Qwen3-MoE's — its
+    # delta_pct was measured against a different baseline (23 tok/s, +635%), and applying that gain
+    # to Qwen3-MoE's 493 frontier inflates the chart 7.4× per PR. Route to landed_qwen36.
+    scored_qwen36 = str(e.get("model") or "").startswith("Qwen3.6")
+    if scored_qwen36:
+        q36 = data.setdefault("qwen36", {})
+        old_f = round(q36.get("frontier_tps") or q36.get("baseline_tps") or 0, 2)
+        new_f = round(max(old_f, e.get("tps") or 0), 2)          # Qwen3.6 frontier: take the max tps seen
+        q36["frontier_tps"] = new_f
+        if e.get("top1") is not None: q36["token_match"] = round(e["top1"], 4)
+        if e.get("kl") is not None:   q36["kl"] = round(e["kl"], 4)
+        short = re.sub(r"^\w+(\([^)]*\))?:\s*", "", e.get("title", ""))[:28]
+        landed = [m for m in data.get("landed_qwen36", []) if m.get("pr") != num and not m.get("baseline")]
+        landed.append({"name": short or f"PR #{num}", "tps": new_f, "pr": num,
+                       "date": datetime.date.today().isoformat(), "label": e.get("label")})
+        data["landed_qwen36"] = sorted(landed, key=lambda m: m["tps"])
+        data["updated"] = datetime.date.today().isoformat()
+        write_dash(data)
+        push_dash(f"dashboard: PR #{num} merged -> Qwen3.6 frontier {new_f} tok/s")
+        return
     if e.get("eval_mode") == "longctx" and int(e.get("score_context") or 0) in (512, 4096, 16384, 32768):
         if any(m.get("pr") == num for m in data.get("landed_longctx", [])): return
         score_ctx = int(e.get("score_context") or 0)
