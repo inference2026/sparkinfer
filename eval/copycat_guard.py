@@ -2,10 +2,11 @@
 """Real-time copycat guard — triggered by pull_request_target (opened).
 
 Fires the instant a PR is opened, fingerprints its diff against every earlier
-open PR that touches the same file(s), and if ≥80% of the new PR's added lines
-are contained in an earlier PR by a DIFFERENT author, the new PR is flagged as a
-copycat, the author is blocked, and the PR is closed — all within seconds of
-creation, before the scheduled eval bot ever sees it.
+open PR that touches the same file(s), and responds with a graduated policy:
+
+  ≥80% containment  →  instant block + close (zero tolerance — unchanged)
+  70–79%            →  copycat-warn label + warning comment (no close, no block)
+  2 warning strikes →  block + close (just like ≥80%)
 
 Self-resubmissions (same author iterating on their own earlier PR) are excluded.
 Only copycat detection runs here — no GPU, no eval, no scoring.
@@ -22,7 +23,9 @@ ROOT = Path(__file__).resolve().parents[1]
 COPYCAT_LOG = ROOT / ".github" / "copycats.json"
 DENYLIST_FILE = ROOT / ".github" / "blocked-contributors.txt"
 FLAG_FILE = ROOT / ".github" / "FLAGGED.md"
-COPYCAT_CONTAINMENT = 0.80
+COPYCAT_CONTAINMENT = 0.80        # ≥80% → instant block + close
+COPYCAT_WARN         = 0.70        # 70–79% → warning label + comment (first time), block on second strike
+MAX_WARNINGS         = 2           # block an account on this many warnings across any PRs
 FLAG_LABEL = "flagged:gaming"
 
 
@@ -79,6 +82,7 @@ def block_account(login, reason):
 
 
 def flag_copycat(repo, num, original, author):
+    """≥80% containment — instant block + close (zero tolerance)."""
     subprocess.run(["gh", "pr", "edit", str(num), "-R", repo, "--add-label", "copycat"],
                    capture_output=True)
     body = (f"<!-- sparkinfer-copycat -->\n## 🐈 Flagged: copycat (real-time guard)\n\n"
@@ -88,6 +92,26 @@ def flag_copycat(repo, num, original, author):
             f"**closed** — zero tolerance, no warning.\n\n"
             f"See [`.github/COPYCATS.md`](../blob/main/.github/COPYCATS.md).")
     subprocess.run(["gh", "pr", "comment", str(num), "-R", repo, "--body", body], capture_output=True)
+
+
+def warn_copycat(repo, num, original, author, strike_count, containment_pct):
+    """70–79% containment — warning label + comment, no close, no block. Block on 2nd strike."""
+    subprocess.run(["gh", "pr", "edit", str(num), "-R", repo, "--add-label", "copycat-warn"],
+                   capture_output=True)
+    will_block = (strike_count >= MAX_WARNINGS)
+    action_line = ("\n\nThis is the **second** copycat-like submission — the account is now "
+                   "**blocked** and the PR closed." if will_block
+                   else f"\n\nThis is a **warning** (strike {strike_count}/{MAX_WARNINGS}). "
+                   "A second copycat-like submission will result in an automatic block.\n\n"
+                   "If this is a legitimate independent implementation, comment on this PR and "
+                   "a maintainer will review.")
+    body = (f"<!-- sparkinfer-copycat-warn -->\n## 🐈 Copycat warning (real-time guard)\n\n"
+            f"This PR is **{containment_pct:.0f}% contained** in the earlier #{original} "
+            f"by a different author, in the 70–79% warning range.{action_line}")
+    subprocess.run(["gh", "pr", "comment", str(num), "-R", repo, "--body", body], capture_output=True)
+    if will_block:
+        close_blocked_pr(repo, num, {author})
+    return will_block
 
 
 def close_blocked_pr(repo, num, hits):
@@ -139,8 +163,9 @@ def main():
     earlier_nums = sorted(p["number"] for p in open_prs if p["number"] < pr_num and not p["isDraft"])
     print(f"  {len(earlier_nums)} earlier open non-draft PRs to check")
 
-    # 4) For each earlier PR touching shared files, fingerprint it. If ≥80% containment -> copycat.
-    original = None
+    # 4) For each earlier PR touching shared files, fingerprint it. If >=70% containment
+    #    -> graduated response: >=80% = instant block; 70-79% = warning (block on 2nd strike).
+    original = None; orig_author = None; best_containment = 0.0
     for e_num in earlier_nums:
         e_author = next((p["author"]["login"] for p in open_prs if p["number"] == e_num), "")
         if not e_author or e_author == author: continue
@@ -149,25 +174,44 @@ def main():
         ef, ea = pr_fingerprint(REPO, e_num)
         if not (files & ef): continue
         c = containment(added, ea)
+        if c > best_containment:
+            original = e_num; orig_author = e_author; best_containment = c
         if c >= COPYCAT_CONTAINMENT:
-            original = e_num
-            orig_author = e_author
-            print(f"  COPYCAT DETECTED: #{pr_num} is {c:.1%} contained in #{e_num} by {e_author}")
             break
 
-    if original is None:
+    if original is None or best_containment < COPYCAT_WARN:
         print(f"  no copycat detected — clean"); return
 
-    # 5) Full treatment: label + comment + block + close
-    flag_copycat(REPO, pr_num, original, author)
-    log.append({"pr": pr_num, "author": author, "original": original,
-                "date": date.today().isoformat()})
-    save_copycat_log(log)
-    block_account(author, f"Auto-blocked: #{pr_num} is a copycat of #{original} "
-                          f"(containment {containment(added, ea):.0%}). "
-                          f"Opened by {author}, copying {orig_author}'s unmerged work.")
-    closed = close_blocked_pr(REPO, pr_num, {author})
-    print(f"  copycat #{pr_num} flagged + blocked + closed={closed}")
+    # 5) Graduated response: ≥80% immediate block; 70-79% warning (block on 2nd strike)
+    is_block = (best_containment >= COPYCAT_CONTAINMENT)
+    warn_strikes = sum(1 for e in log if e.get("author") == author and not e.get("blocked", True))
+    strike_count = warn_strikes + 1
+
+    if is_block:
+        print(f"  COPYCAT (≥80%): #{pr_num} is {best_containment:.1%} contained in #{original} by {orig_author}")
+        flag_copycat(REPO, pr_num, original, author)
+        log.append({"pr": pr_num, "author": author, "original": original,
+                    "date": date.today().isoformat(), "blocked": True})
+        save_copycat_log(log)
+        block_account(author, f"Auto-blocked: #{pr_num} is a copycat of #{original} "
+                              f"(containment {best_containment:.0%}). "
+                              f"Opened by {author}, copying {orig_author}'s unmerged work.")
+        closed = close_blocked_pr(REPO, pr_num, {author})
+        print(f"  copycat #{pr_num} flagged + blocked + closed={closed}")
+    else:
+        print(f"  COPYCAT WARNING (70-79%): #{pr_num} is {best_containment:.1%} contained in #{original} by {orig_author} (strike {strike_count}/{MAX_WARNINGS})")
+        will_block = warn_copycat(REPO, pr_num, original, author, strike_count, best_containment)
+        log.append({"pr": pr_num, "author": author, "original": original,
+                    "date": date.today().isoformat(), "blocked": False,
+                    "penalty_days": 0, "strike": strike_count,
+                    "containment": round(best_containment, 3)})
+        save_copycat_log(log)
+        if will_block:
+            block_account(author, f"Auto-blocked after {strike_count} copycat warnings "
+                                  f"(latest: #{pr_num}, {best_containment:.0%} contained in #{original} "
+                                  f"by {orig_author}). Two-strike rule.")
+            # close after denylisting
+            close_blocked_pr(REPO, pr_num, {author})
 
     # Push the updated github-policy files so the bot's run stays in sync
     subprocess.run(["git", "-C", str(ROOT), "add",
@@ -175,7 +219,7 @@ def main():
                    capture_output=True)
     if subprocess.run(["git", "-C", str(ROOT), "diff", "--cached", "--quiet"]).returncode != 0:
         subprocess.run(["git", "-C", str(ROOT), "commit", "-q",
-                        "-m", f"copycat-guard: #{pr_num} flagged as copycat of #{original} by {author}"],
+                        "-m", f"copycat-guard: #{pr_num} flagged by {author}"],
                        capture_output=True)
         subprocess.run(["git", "-C", str(ROOT), "pull", "-q", "--rebase", "origin", "main"],
                        capture_output=True)
