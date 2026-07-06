@@ -210,8 +210,6 @@ def main():
     ap.add_argument("--dual", action="store_true",
                     help="score Qwen3.6-35B-A3B and guard Qwen3-30B-A3B against no-regression in one build "
                          "(--guard-*-baseline are the Qwen3-30B guard; --p-* are the Qwen3.6 scored target)")
-    ap.add_argument("--primary-frontier", type=float, default=0,
-                    help="[--dual] Qwen3.6 current best verified tok/s (the scored frontier); falls back to --frontier")
     ap.add_argument("--p-guard-128-baseline", type=float, default=0, help="[--dual] Qwen3.6 main 128-token decode tok/s")
     ap.add_argument("--p-guard-512-baseline", type=float, default=0, help="[--dual] Qwen3.6 main 512-context tok/s")
     ap.add_argument("--p-guard-4k-baseline",  type=float, default=0, help="[--dual] Qwen3.6 main 4k-context tok/s")
@@ -478,7 +476,7 @@ def main():
                   f"SPARKINFER_P_LLAMA_32K_BASELINE={args.p_llama_32k_baseline} "
                   f"MODELS_DIR=/workspace/models LLAMACPP_DIR={LLAMACPP_DIR} "
                   f"bench/scripts/evaluate_dual.sh --ref {args.ref} "
-                  f"--primary-frontier {args.primary_frontier or args.frontier} --ceiling {args.ceiling}")
+                  f"--ceiling {args.ceiling}")
         else:
             ev = (f"cd /root/sparkinfer && git fetch -q origin main && git checkout -q origin/main -- bench/scripts && "
                   f"SI_NO_CHECKOUT=1 SPARKINFER_EVAL_SEED={eval_seed} SPARKINFER_DIFFICULTY_BOOST=1 "

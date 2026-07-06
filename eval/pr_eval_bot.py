@@ -356,22 +356,20 @@ def render(res, oid):
     if res.get("regression_labels") or res.get("guard_regression_labels"):
         allregs = (res.get("regression_labels") or []) + (res.get("guard_regression_labels") or [])
         rows.append(f"| regressions | {', '.join(allregs)} |")
-    if "frontier_tps" in res and res["frontier_tps"]:
-        # Label it "prior frontier" when this PR superseded it, so the old value isn't mistaken
-        # for the current live frontier (which is now this PR's tps).
-        rows.insert(2, f"| {'vs prior frontier' if advanced else 'vs frontier'} | {res['frontier_tps']} tok/s → "
+    if "frontier_tps" in res and res.get("frontier_tps", 0) > 0:
+        # "frontier_tps" is now the SAME-BOX origin/main baseline — the gain is measured directly
+        # against main on the same GPU in the same run, not a passed-in frontier number.
+        rows.insert(2, f"| vs same-box main | {res['frontier_tps']} tok/s → "
                        f"{res.get('pct_over_frontier', 0):+.1f}% ({res.get('delta_tps',0):+.1f}) |")
-    if advanced:
-        rows.insert(3, f"| **→ new frontier** | **{res.get('tps')} tok/s** |")
     note = {"REJECT": f"**Rejected** — {res.get('reason','')}.",
-            "none": "Within the significance gate — no *verified* speedup over the current frontier.",
-            "BASELINE": "No frontier was set; this run establishes it."
-            }.get(label, f"Verified speedup — **sets the new frontier to {res.get('tps')} tok/s** "
-                         f"(was {res.get('frontier_tps','?')}).")
+            "none": "Within the significance gate — no *verified* speedup over same-box main.",
+            "BASELINE": "No same-box main baseline was set; this run establishes one."
+            }.get(label, f"Verified speedup over same-box origin/main — "
+                         f"{res.get('tps')} tok/s (main was {res.get('frontier_tps','?')} tok/s).")
     if label == "REJECT" and res.get("auto_close"):
         note = "No context cleared the 2% significance gate while at least one context regressed. Auto-closing this PR."
-    target_note = ("128/512/4k/16k/32k guarded · strongest context scores"
-                   if res.get("eval_mode") == "longctx" else "128-token decode frontier")
+    target_note = ("128/512/4k/16k/32k guarded · scored vs same-box main · strongest context scores"
+                   if res.get("eval_mode") == "longctx" else "128-token decode scored vs same-box main")
     return (f"<!-- sparkinfer-eval:{oid} -->\n"
             f"## {icon} sparkinfer auto-eval — `{oid}`\n\n"
             f"| metric | value |\n|---|---|\n" + "\n".join(rows) + "\n\n"
@@ -773,19 +771,15 @@ def reconcile_merge_labels(repo):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--instance", type=int, required=True, help="vast.ai instance id to reuse")
-    ap.add_argument("--frontier", type=float, default=0)
+    ap.add_argument("--frontier", type=float, default=0, help="DEPRECATED: scoring now uses same-box origin/main baseline")
     ap.add_argument("--ceiling", type=float, default=0)
     ap.add_argument("--repo", default="gittensor-ai-lab/sparkinfer")
     ap.add_argument("--dry-run", action="store_true", help="evaluate + print, but don't label/comment")
-    # Dual-model: score Qwen3.6-35B-A3B (primary) and guard Qwen3-30B against no-regression. The
-    # Qwen3-30B guard baselines are still measured same-box each run (run_guard_*); the Qwen3.6
-    # primary baselines are stable config constants (no Qwen3.6-optimizing PR has moved them yet) —
-    # overridable via env until a same-box Qwen3.6 baseline pass is added.
+    # Dual-model: score Qwen3.6-35B-A3B (primary) and guard Qwen3-30B against no-regression.
+    # Each PR is scored directly against the SAME-BOX origin/main baseline (measured once per run),
+    # not a passed-in frontier number — so the gain is hardware-independent and always current.
     ap.add_argument("--dual", action="store_true",
                     help="score Qwen3.6 (primary) + guard Qwen3-30B (no-regression) via evaluate_dual.sh")
-    ap.add_argument("--primary-frontier", type=float,
-                    default=float(os.environ.get("SPARKINFER_QWEN36_FRONTIER", "23.0")),
-                    help="[--dual] Qwen3.6 current best verified 128/512/4k tok/s (the scored frontier)")
     args = ap.parse_args()
     # Qwen3.6 same-box origin/main baselines (128/512/4k). Env-overridable; measured 2026-07 on RTX 5090.
     QWEN36_BASE = {
@@ -1004,11 +998,10 @@ def main():
         # optimizations STACK, re-evaluate the second after merging the first. Literal duplicates are
         # caught by copycat detection; emission only pays MERGED PRs, so the maintainer's merge choice
         # (not eval order) decides what counts.
-        cur_frontier = run_baseline
         cur_iid = current_instance(args.instance)
         cmd = [sys.executable, os.path.join(HERE, "vast_eval.py"),
                "--reuse", str(cur_iid), "--ref", ref,
-               "--frontier", str(cur_frontier), "--ceiling", str(args.ceiling),
+               "--frontier", "0", "--ceiling", str(args.ceiling),
                "--eval-mode", "longctx", "--guard-128-baseline", str(run_guard_128),
                "--guard-512-baseline", str(run_guard_512),
                "--guard-4k-baseline", str(run_guard_4k),
@@ -1017,8 +1010,9 @@ def main():
                "--keep"]            # keep instance alive — bot stops it after all PRs
         if args.dual:
             # Qwen3.6 scored (128/512/4k); the --guard-*-baseline above become the Qwen3-30B guard.
+            # Scoring base = same-box origin/main baseline (the guard baselines), not a passed-in frontier.
             cmd[cmd.index("--keep"):cmd.index("--keep")] = [
-                "--dual", "--primary-frontier", str(args.primary_frontier),
+                "--dual",
                 "--p-guard-128-baseline", str(QWEN36_BASE["128"]),
                 "--p-guard-512-baseline", str(QWEN36_BASE["512"]),
                 "--p-guard-4k-baseline",  str(QWEN36_BASE["4k"]),
@@ -1028,7 +1022,7 @@ def main():
         if PINNED_INSTANCE and str(cur_iid) == PINNED_INSTANCE:
             cmd.append("--pinned")  # never destroy the pin; retry-then-fallback on bring-up failure
         pinned = "--pinned" in cmd
-        print(f"PR #{num} @ {oid}: evaluating '{ref}' (frontier={cur_frontier}) on instance "
+        print(f"PR #{num} @ {oid}: evaluating '{ref}' (vs same-box main) on instance "
               f"{cur_iid}{' [pinned]' if pinned else ''} ...")
         r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=14400)
         if r.returncode == PINNED_RETRY_RC:
