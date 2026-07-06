@@ -135,6 +135,84 @@ __global__ void l2_norm_qk_kernel(__nv_bfloat16* __restrict__ q,
     if (t < head_dim) x[base + t] = __float2bfloat16(xv * sw[0]);
 }
 
+// Fused conv + L2-norm for q/k heads: replaces conv_split (q/k part) + l2_norm_qk.
+// One block per head (q_heads*2 = 32 blocks). Each thread computes the causal conv
+// + SiLU for its position, then does an in-block L2 norm reduction and writes the
+// normalized q/k output. conv_state is updated inline.
+__global__ void conv_l2_qk_kernel(
+    const __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ conv_w,
+    __nv_bfloat16* __restrict__ conv_state,
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    int q_dim, int qkv_dim, int conv_kernel, int head_dim, float eps)
+{
+    const int h = blockIdx.x, t = threadIdx.x;
+    const int q_heads = q_dim / head_dim;
+    const bool is_q = (h < q_heads);
+    const int hh = is_q ? h : (h - q_heads);
+    const int d = is_q ? (hh * head_dim + t) : (q_dim + hh * head_dim + t);
+
+    // causal conv + SiLU
+    float y = 0.f;
+    if (t < head_dim) {
+        for (int c = 0; c < conv_kernel - 1; c++)
+            y += q36_to_f(conv_state[(size_t)c * qkv_dim + d]) *
+                 q36_to_f(conv_w[(size_t)d * conv_kernel + c]);
+        y += q36_to_f(qkv[d]) * q36_to_f(conv_w[(size_t)d * conv_kernel + (conv_kernel - 1)]);
+    }
+    const float xv = q36_silu(y);
+
+    // L2 norm (in-block, identical to l2_norm_qk)
+    __shared__ float sw[32];
+    float ss = (t < head_dim) ? xv * xv : 0.f;
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, m);
+    if ((t & 31) == 0) sw[t >> 5] = ss;
+    __syncthreads();
+    if (t < 32) {
+        float v = (t < (blockDim.x + 31) / 32) ? sw[t] : 0.f;
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+        if (t == 0) sw[0] = rsqrtf(v / head_dim + eps);
+    }
+    __syncthreads();
+
+    // write normalized output + update conv_state
+    if (t < head_dim) {
+        __nv_bfloat16* dst = is_q ? q : k;
+        dst[hh * head_dim + t] = __float2bfloat16(xv * sw[0]);
+        for (int c = 0; c < conv_kernel - 2; c++)
+            conv_state[(size_t)c * qkv_dim + d] = conv_state[(size_t)(c + 1) * qkv_dim + d];
+        if (conv_kernel > 1)
+            conv_state[(size_t)(conv_kernel - 2) * qkv_dim + d] = qkv[d];
+    }
+}
+
+// Conv-only for v heads (no L2 norm). Mirrors conv_split_kernel but only covers
+// v positions (d >= 2*q_dim). One 256-thread block.
+__global__ void conv_v_kernel(
+    const __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ conv_w,
+    __nv_bfloat16* __restrict__ conv_state,
+    __nv_bfloat16* __restrict__ v,
+    int q_dim, int v_dim, int qkv_dim, int conv_kernel)
+{
+    const int d = 2 * q_dim + blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= qkv_dim) return;
+    float y = 0.f;
+    for (int c = 0; c < conv_kernel - 1; c++)
+        y += q36_to_f(conv_state[(size_t)c * qkv_dim + d]) *
+             q36_to_f(conv_w[(size_t)d * conv_kernel + c]);
+    y += q36_to_f(qkv[d]) * q36_to_f(conv_w[(size_t)d * conv_kernel + (conv_kernel - 1)]);
+    const __nv_bfloat16 oy = __float2bfloat16(q36_silu(y));
+    v[d - 2 * q_dim] = oy;
+    for (int c = 0; c < conv_kernel - 2; c++)
+        conv_state[(size_t)c * qkv_dim + d] = conv_state[(size_t)(c + 1) * qkv_dim + d];
+    if (conv_kernel > 1)
+        conv_state[(size_t)(conv_kernel - 2) * qkv_dim + d] = qkv[d];
+}
+
 __global__ void gdn_ar_kernel(const __nv_bfloat16* __restrict__ q,
                               const __nv_bfloat16* __restrict__ k,
                               const __nv_bfloat16* __restrict__ v,
@@ -355,18 +433,21 @@ void launch_qwen36_conv_split_l2(const void* qkv_bf16, const void* conv_w_bf16,
     const int q_dim = q_heads * head_dim;
     const int v_dim = v_heads * head_dim;
     const int qkv_dim = 2 * q_dim + v_dim;
-    conv_split_kernel<<<(qkv_dim + 255) / 256, 256, 0, stream>>>(
+    // conv + L2-norm fused for q/k heads (one block per head)
+    conv_l2_qk_kernel<<<q_heads * 2, head_dim, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(qkv_bf16),
         reinterpret_cast<const __nv_bfloat16*>(conv_w_bf16),
         reinterpret_cast<__nv_bfloat16*>(conv_state_bf16),
         reinterpret_cast<__nv_bfloat16*>(q_bf16),
         reinterpret_cast<__nv_bfloat16*>(k_bf16),
+        q_dim, qkv_dim, conv_kernel, head_dim, eps);
+    // v heads: conv-only (no L2 norm), 256-thread grid same as original conv_split
+    conv_v_kernel<<<(v_dim + 255) / 256, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(qkv_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(conv_w_bf16),
+        reinterpret_cast<__nv_bfloat16*>(conv_state_bf16),
         reinterpret_cast<__nv_bfloat16*>(v_bf16),
         q_dim, v_dim, qkv_dim, conv_kernel);
-    l2_norm_qk_kernel<<<q_heads * 2, head_dim, 0, stream>>>(
-        reinterpret_cast<__nv_bfloat16*>(q_bf16),
-        reinterpret_cast<__nv_bfloat16*>(k_bf16),
-        q_heads, head_dim, eps);
 }
 
 void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_bf16,
