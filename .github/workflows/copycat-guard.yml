@@ -1,0 +1,33 @@
+name: copycat-guard
+# Real-time copycat detection — fires the instant a PR is opened (pull_request_target
+# runs from the BASE branch context, so it has full repo access to read all PRs, label,
+# comment, and close). No GPU, no eval — just fingerprint comparison against all earlier
+# open PRs. If >=80% containment in a different author's earlier PR, the new PR is
+# flagged, the account blocked, and the PR closed within seconds of creation.
+
+on:
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  contents: write          # push policy files (copycats.json, blocked-contributors.txt)
+  pull-requests: write     # label + comment + close
+  issues: write            # PR comment (shares the Issues permission)
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    # Don't block maintainer PRs — only guard external contributions
+    if: github.event.pull_request.author_association != 'OWNER' && github.event.pull_request.author_association != 'MEMBER' && github.event.pull_request.author_association != 'COLLABORATOR'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run copycat guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+        run: |
+          PR_NUM="$PR_NUM" python3 eval/copycat_guard.py
