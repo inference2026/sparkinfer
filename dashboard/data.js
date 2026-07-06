@@ -150,7 +150,7 @@ window.SPARKINFER = {
       "top1": 0.97,
       "kl": 0.02,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/243",
-      "proof_url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/243#issuecomment-4889142494"
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0243-79058f2"
     },
     {
       "num": 241,
@@ -165,7 +165,7 @@ window.SPARKINFER = {
       "top1": 0.97,
       "kl": 0.02,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/241",
-      "proof_url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/241#issuecomment-4889091778"
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0241-2aa0768"
     },
     {
       "num": 239,
@@ -180,7 +180,7 @@ window.SPARKINFER = {
       "top1": 0.97,
       "kl": 0.02,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/239",
-      "proof_url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/239#issuecomment-4889090888"
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0239-cd383fb"
     },
     {
       "num": 237,
@@ -195,7 +195,7 @@ window.SPARKINFER = {
       "top1": 0.9885,
       "kl": 0.0096,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/237",
-      "proof_url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/237#issuecomment-4889090598"
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0237-e490d89"
     },
     {
       "num": 234,
