@@ -640,7 +640,17 @@ def record_merge(repo, num):
     # a clean calibrated ladder. Falls back to raw max() only if the gain wasn't recorded.
     old_f = round(data["status"].get("frontier_tps") or 0, 2)
     gain = (e.get("delta_pct") or 0) / 100.0
-    new_f = round(old_f * (1 + gain), 2) if gain > 0 else max(old_f, round(e.get("tps") or 0, 2))
+    # Safety: if the model field is missing (stale dual-eval record before the Qwen3.6 routing was
+    # added) the delta_pct may be from a different model's baseline, producing impossible gains
+    # (e.g. Qwen3.6's +50% applied to Qwen3-30B's frontier). A >30% single-step gain on Qwen3-30B
+    # is physically implausible at this stage — treat it as a routing error and fall back to raw tps.
+    model_name = str(e.get("model") or "")
+    if gain > 0.30 and not model_name.startswith("Qwen3.6"):
+        print(f">> record_merge: PR #{num} delta_pct={e.get('delta_pct')}% applied to Qwen3-30B "
+              f"frontier {old_f} is implausible (model={model_name!r}) — falling back to raw tps")
+        new_f = max(old_f, round(e.get("tps") or 0, 2))
+    else:
+        new_f = round(old_f * (1 + gain), 2) if gain > 0 else max(old_f, round(e.get("tps") or 0, 2))
     data["status"]["frontier_tps"] = new_f
     if e.get("eval_mode") == "longctx":
         _upsert_context_baselines(data, e)
@@ -1000,36 +1010,36 @@ def main():
               f"Aborting; NO PRs graded. Re-run on a warm, stable box.")
         return
 
-        # Dual mode: bench Qwen3.6 main directly on the box — the same build the Qwen3-30B
-        # baseline already verified. No accuracy gate, just a 3-context decode sweep.
-        if args.dual and _vast_sh and _vast_endpoint and _vast_info_of:
-            import vastai
-            v = vastai.VastAI()
-            info = _vast_info_of(v, base_iid)
-            if info:
-                host, port = _vast_endpoint(info)
-                M36 = "/workspace/models36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
-                B36 = "/root/sparkinfer/build/runtime/qwen3_gguf_bench"
-                tps128 = tps512 = tps4k = 0.0
-                for label, ctx in [("128", 0), ("512", 512), ("4096", 4096)]:
-                    cmd = f"export PATH=/usr/local/cuda/bin:$PATH; {B36} '{M36}' 128 {ctx}"
-                    r = _vast_sh(host, port, cmd, timeout=600)
-                    m = re.search(r"decode\s+tg\s*:\s*([0-9.]+)", r.stdout + r.stderr)
-                    if m: tps = float(m.group(1))
-                    else: tps = 0.0
-                    if label == "128": tps128 = tps
-                    elif label == "512": tps512 = tps
-                    else: tps4k = tps
-                    print(f"    ctx={label} tps={tps}")
-                if tps128 > 0:
-                    QWEN36_BASE["128"] = tps128
-                    QWEN36_BASE["512"] = tps512 if tps512 > 0 else round(tps128 * 0.98, 2)
-                    QWEN36_BASE["4k"]  = tps4k  if tps4k  > 0 else round(tps128 * 0.93, 2)
-                    print(f"  Qwen3.6 same-box main: 128={tps128} 512={QWEN36_BASE['512']} 4k={QWEN36_BASE['4k']} tok/s")
-                else:
-                    print(f"  Qwen3.6 bench failed — using defaults: {QWEN36_BASE['128']}/{QWEN36_BASE['512']}/{QWEN36_BASE['4k']}")
+    # Dual mode: bench Qwen3.6 main directly on the box — the same build the Qwen3-30B
+    # baseline already verified. No accuracy gate, just a 3-context decode sweep.
+    if args.dual and _vast_sh and _vast_endpoint and _vast_info_of:
+        import vastai
+        v = vastai.VastAI()
+        info = _vast_info_of(v, base_iid)
+        if info:
+            host, port = _vast_endpoint(info)
+            M36 = "/workspace/models36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+            B36 = "/root/sparkinfer/build/runtime/qwen3_gguf_bench"
+            tps128 = tps512 = tps4k = 0.0
+            for label, ctx in [("128", 0), ("512", 512), ("4096", 4096)]:
+                cmd = f"export PATH=/usr/local/cuda/bin:$PATH; {B36} '{M36}' 128 {ctx}"
+                r = _vast_sh(host, port, cmd, timeout=600)
+                m = re.search(r"decode\s+tg\s*:\s*([0-9.]+)", r.stdout + r.stderr)
+                if m: tps = float(m.group(1))
+                else: tps = 0.0
+                if label == "128": tps128 = tps
+                elif label == "512": tps512 = tps
+                else: tps4k = tps
+                print(f"    ctx={label} tps={tps}")
+            if tps128 > 0:
+                QWEN36_BASE["128"] = tps128
+                QWEN36_BASE["512"] = tps512 if tps512 > 0 else round(tps128 * 0.98, 2)
+                QWEN36_BASE["4k"]  = tps4k  if tps4k  > 0 else round(tps128 * 0.93, 2)
+                print(f"  Qwen3.6 same-box main: 128={tps128} 512={QWEN36_BASE['512']} 4k={QWEN36_BASE['4k']} tok/s")
             else:
-                print(f"  could not get endpoint for instance {base_iid} — using config defaults")
+                print(f"  Qwen3.6 bench failed — using defaults: {QWEN36_BASE['128']}/{QWEN36_BASE['512']}/{QWEN36_BASE['4k']}")
+        else:
+            print(f"  could not get endpoint for instance {base_iid} — using config defaults")
 
     # Run all pending evals on the SAME instance: pass --keep so vast_eval.py never stops/destroys
     # the box mid-queue. The bot stops the instance once after ALL PRs finish (or if the instance
@@ -1057,9 +1067,9 @@ def main():
             # Scoring base = same-box origin/main baseline (the guard baselines), not a passed-in frontier.
             cmd[cmd.index("--keep"):cmd.index("--keep")] = [
                 "--dual",
-                "--p-guard-128-baseline", "0",
-                "--p-guard-512-baseline", "0",
-                "--p-guard-4k-baseline",  "0",
+                "--p-guard-128-baseline", str(QWEN36_BASE["128"]),
+                "--p-guard-512-baseline", str(QWEN36_BASE["512"]),
+                "--p-guard-4k-baseline",  str(QWEN36_BASE["4k"]),
                 "--p-llama-128-baseline", str(QWEN36_BASE["llama128"]),
                 "--p-llama-512-baseline", str(QWEN36_BASE["llama512"]),
                 "--p-llama-4k-baseline",  str(QWEN36_BASE["llama4k"])]
