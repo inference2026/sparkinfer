@@ -312,13 +312,15 @@ int Qwen35Model::forward_token(int token_id, int position) {
 
     // Depth-adaptive KV-split: keep 32 splits for the short-context sweet spot, then jump to
     // the 128-split occupancy plateau on RTX 5090. The split grid is num_kv_heads*n_splits CTAs,
-    // so 64 splits still underfills mid-context decode; 128 improves 512/2k/4k. Past the 16k
-    // knee, use MAX_NSPLITS to keep each split's serial KV chunk bounded. Partials are sized for
-    // MAX_NSPLITS, and the online-softmax combine is exact for any split count (accuracy unchanged).
+    // so 64 splits still underfills mid-context decode; 128 improves 512/2k/4k. The int8 MMA path
+    // benefits from denser per-split work (>=2 outer-loop groups) over extreme splitting; past
+    // 16k keep 128 splits so each chunk stays >=256 tokens while the split grid still fills SMs.
+    // Partials are sized for MAX_NSPLITS; the online-softmax combine is exact for any split count.
     if (s.adaptive_splits) {
         int want = 32;
         if ((long)seqlen > 2L * s.split_chunk) want = 128;
-        if ((long)seqlen > 64L * s.split_chunk) want = Impl::MAX_NSPLITS;
+        if (s.kv->int8_kv() && (long)seqlen > 4L * s.split_chunk) want = 160;
+        if ((long)seqlen > 64L * s.split_chunk) want = 128;
         if (want > Impl::MAX_NSPLITS) want = Impl::MAX_NSPLITS;
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
