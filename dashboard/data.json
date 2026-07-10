@@ -2445,30 +2445,30 @@
   "qwen35": {
     "model": "Qwythos-9B (Qwen3.5-9B) · Q4_K_M",
     "arch": "dense hybrid Gated-DeltaNet + full-attn · 9B · hd256",
-    "frontier_tps": 271.85,
+    "frontier_tps": 281.63,
     "baseline_tps": 256.95,
     "ref_name": "llama.cpp",
     "ref_tps": 224.91,
-    "token_match": 0.9665,
-    "kl": 0.0261,
+    "token_match": 0.9595,
+    "kl": 0.0274,
     "note": "PR #323 merged · same-box main baseline + eval:S @128 ctx · RTX 5090",
     "ctx": [
       {
         "label": "128",
         "color": "#D14D72",
-        "tps": 287.61,
+        "tps": 314.6,
         "ref_tps": 224.91
       },
       {
         "label": "512",
         "color": "#7B5DFF",
-        "tps": 283.3,
+        "tps": 309.39,
         "ref_tps": 225.1
       },
       {
         "label": "4k",
         "color": "#0E8A16",
-        "tps": 269.77,
+        "tps": 293.77,
         "ref_tps": 224.68
       }
     ]
@@ -2480,6 +2480,13 @@
       "pr": 323,
       "date": "2026-07-10",
       "label": "S"
+    },
+    {
+      "name": "tune dense split-K and int8 ",
+      "tps": 281.63,
+      "pr": 324,
+      "date": "2026-07-10",
+      "label": "M"
     }
   ],
   "qwen36": {
