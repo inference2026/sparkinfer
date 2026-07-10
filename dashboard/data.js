@@ -2910,36 +2910,36 @@ window.SPARKINFER = {
     "ref_tps": 275.81,
     "token_match": 0.9534,
     "kl": 0.0122,
-    "note": "scored vs same-box main · GDN_FAST default ON · #241 #243 #266 #269 #279 #284 #282 merged",
+    "note": "post-#300 hd256 MMA correctness rebench 2026-07-10 (RTX 5090, 3-rep median); 16k/32k corrected down from inflated broken-MMA frontier",
     "ctx": [
       {
         "label": "128",
         "color": "#7B5DFF",
-        "tps": 426.0,
+        "tps": 423.77,
         "ref_tps": 275.81
       },
       {
         "label": "512",
         "color": "#0E8A16",
-        "tps": 419.18,
+        "tps": 420.23,
         "ref_tps": 275.61
       },
       {
         "label": "4k",
         "color": "#B8860B",
-        "tps": 402.37,
+        "tps": 403.22,
         "ref_tps": 276.3
       },
       {
         "label": "16k",
         "color": "#D14D72",
-        "tps": 385.24,
+        "tps": 378.74,
         "ref_tps": 280.66
       },
       {
         "label": "32k",
         "color": "#6F42C1",
-        "tps": 363.48,
+        "tps": 351.82,
         "ref_tps": 279.83
       }
     ]
