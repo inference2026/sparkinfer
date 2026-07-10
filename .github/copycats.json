@@ -55,5 +55,14 @@
     "penalty_days": 0,
     "strike": 1,
     "containment": 0.41
+  },
+  {
+    "pr": 326,
+    "author": "inference2026",
+    "original": 195,
+    "date": "2026-07-10",
+    "blocked": false,
+    "penalty_days": 0,
+    "note": "maintainer-cleared false positive: guard matched template boilerplate vs #195; actual PR-level containment 27%"
   }
 ]
