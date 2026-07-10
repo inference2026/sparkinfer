@@ -46,6 +46,11 @@ void launch_gemv(const void* x, const void* W, void* y, int N, int K,
 void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K,
                      cudaStream_t stream = nullptr);
 
+// Fused GEMV + sigmoid for the shared-expert gate scalar (N=1). Uses scratch_bf16
+// for the bf16 dot (same as launch_gemv) then sigmoid_scalar. SPARKINFER_GEMV_SIGMOID=1 enables.
+void launch_gemv_sigmoid(const void* x, const void* W, void* scratch_bf16, float* y, int K,
+                         cudaStream_t stream = nullptr);
+
 // Quantized on-read GEMV: same as launch_gemv but W is GGUF-native Q4_K/Q6_K/Q8_0
 // [N,K] (wtype = ggml type id, 12=Q4_K / 14=Q6_K / 8=Q8_0). Dequantizes each block in
 // registers with a full-precision (fp32) activation dot — reads the quantized
@@ -71,6 +76,10 @@ size_t llama_q8_1_bytes(int K);
 void launch_quantize_q8_1_blocks(const void* x, void* y, int K, cudaStream_t stream = nullptr);
 void launch_mmvq_q4k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream = nullptr);
 void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);
+// Fused GDN qkv+z Q4_K MMVQ (shared Q8_1 activation). K is hidden (2048 -> NSUPER=8, 4096 -> 16).
+void launch_mmvq_gdn_qkv_z_pack2(const void* q81, const void* qkv_w, const void* z_w,
+                                 void* qkv_out, void* z_out, int n_qkv, int n_z, int K,
+                                 cudaStream_t stream = nullptr);
 // Same, for Q6_K weights (attn-V upgrades + LM head). q81 = block_q8_1(activation).
 void launch_mmvq_q6k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream = nullptr);
 void launch_mmvq_q6k_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);

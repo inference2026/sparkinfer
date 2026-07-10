@@ -55,7 +55,9 @@ bool ggml_dequant_supported(int ggml_type) {
 
 long qwen_moe_meta_int(const GGUF& g, const std::string& key, long def) {
     const long missing = std::numeric_limits<long>::min();
-    long v = g.meta_int("qwen35moe." + key, missing);
+    long v = g.meta_int("qwen35." + key, missing);
+    if (v != missing) return v;
+    v = g.meta_int("qwen35moe." + key, missing);
     if (v != missing) return v;
     v = g.meta_int("qwen3moe." + key, missing);
     if (v != missing) return v;
@@ -67,6 +69,10 @@ bool is_qwen35_or_qwen36_hybrid_moe(const GGUF& g) {
     const std::string name = g.meta_str("general.name");
     if (name.find("Qwen3.5-35B-A3B") != std::string::npos ||
         name.find("Qwen3.6-35B-A3B") != std::string::npos)
+        return true;
+
+    if (g.tensor("blk.0.attn_qkv.weight") != nullptr &&
+        g.tensor("blk.3.attn_q.weight") != nullptr)
         return true;
 
     const GGUFTensor* emb = g.tensor("token_embd.weight");
@@ -224,13 +230,13 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     // Fused-expert + flash-decoding decode scratch (batch 1). Allocated here so
     // EVERY load path (set_weights / load_weights / load_gguf) has it — not just
     // GGUF. (fa_* NULL here is what crashed flash_decode_split on the non-GGUF path.)
-    p_->mf_logits  = p_->alloc<float>(cfg.n_experts);
-    p_->mf_ids     = p_->alloc<int>(cfg.top_k);
-    p_->mf_weights = p_->alloc<float>(cfg.top_k);
-    p_->mf_counts  = p_->alloc<int>(cfg.n_experts);
+    p_->mf_logits  = p_->alloc<float>(std::max(1, cfg.n_experts));
+    p_->mf_ids     = p_->alloc<int>(std::max(1, cfg.top_k));
+    p_->mf_weights = p_->alloc<float>(std::max(1, cfg.top_k));
+    p_->mf_counts  = p_->alloc<int>(std::max(1, cfg.n_experts));
     p_->mf_rc      = p_->alloc<unsigned int>(1);
     cu(cudaMemset(p_->mf_rc, 0, sizeof(unsigned int)), "mf_rc zero");   // grid-completion counter starts at 0
-    p_->mf_h       = p_->alloc<float>((size_t)cfg.top_k * cfg.moe_ffn);
+    p_->mf_h       = p_->alloc<float>((size_t)std::max(1, cfg.top_k) * cfg.moe_ffn);
     p_->mf_out     = p_->alloc<float>(cfg.hidden);
     if (cfg.dense_ffn && cfg.top_k > 0) {
         cu(cudaMemcpy(p_->mf_ids, &zero, sizeof(int), cudaMemcpyHostToDevice), "dense expert id");
@@ -315,15 +321,16 @@ int Qwen35Model::forward_token(int token_id, int position) {
     s.h_scalars[3] = seqlen;
     cu(cudaMemcpyAsync(s.d_scalars, s.h_scalars, 4 * sizeof(int), cudaMemcpyHostToDevice, st), "decode scalars");
 
-    // Depth-adaptive KV-split: keep 32 splits for the short-context sweet spot, then jump to
-    // the 128-split occupancy plateau on RTX 5090. The split grid is num_kv_heads*n_splits CTAs,
-    // so 64 splits still underfills mid-context decode; 128 improves 512/2k/4k. Past the 16k
-    // knee, use MAX_NSPLITS to keep each split's serial KV chunk bounded. Partials are sized for
-    // MAX_NSPLITS, and the online-softmax combine is exact for any split count (accuracy unchanged).
+    // Depth-adaptive KV-split: keep 32 splits for the short-context sweet spot, then
+    // scale to 128/256 splits as context grows. The split grid is num_kv_heads*n_splits
+    // CTAs — Qwen3.6 full-attention has only 2 KV-heads (hd=256), so 128 splits at 4k
+    // is just 256 CTAs; 256 splits at 8k+ doubles that. Per-block chunk stays in the
+    // 32-128 token range for good TILE=14 amortization.
+    // Partials are sized for MAX_NSPLITS; online-softmax combine is exact for any split count.
     if (s.adaptive_splits) {
         int want = 32;
-        if ((long)seqlen > 2L * s.split_chunk) want = 128;
-        if ((long)seqlen > 64L * s.split_chunk) want = Impl::MAX_NSPLITS;
+        if ((long)seqlen > 2L * s.split_chunk)  want = 128;
+        if ((long)seqlen > 32L * s.split_chunk) want = 256;
         if (want > Impl::MAX_NSPLITS) want = Impl::MAX_NSPLITS;
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
@@ -448,7 +455,24 @@ int Qwen35Model::forward_token(int token_id, int position) {
                                   w.ssm_alpha_type == 8 || w.ssm_beta_type == 8);
             prepare_xn_quant(any_q4k, any_q6k, any_q80);
             const bool gdn_pipelined = s.gguf && s.use_gdn_pipe;
-            if (gdn_pipelined) {
+            const bool gdn_fused_proj = [&] {
+                static int fuse = -1;
+                if (fuse < 0) { const char* e = getenv("SPARKINFER_GDN_QKVZ_FUSE");
+                    fuse = (e && e[0] == '0') ? 0 : 1; }
+                return fuse && s.gguf && s.use_pq && s.use_llama &&
+                       w.wqkv_type == 12 && w.wqkv_gate_type == 12 &&
+                       (H == 2048 || H == 4096) && s.linear_qkvdim > 0 && s.linear_vdim > 0;
+            }();
+            if (gdn_fused_proj && gdn_pipelined) {
+                cudaEventRecord(s.ev_pipe_fork, st);
+                cudaStreamWaitEvent(s.stream_v, s.ev_pipe_fork, 0);
+                proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, s.stream_v);
+                proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, s.stream_v);
+                cudaEventRecord(s.ev_gdn_ab, s.stream_v);
+                kernels::launch_mmvq_gdn_qkv_z_pack2(s.aq81, w.wqkv, w.wqkv_gate,
+                                                       s.lin_qkv, s.lin_z,
+                                                       s.linear_qkvdim, s.linear_vdim, H, st);
+            } else if (gdn_pipelined && !gdn_fused_proj) {
                 cudaEventRecord(s.ev_pipe_fork, st);
                 cudaStreamWaitEvent(s.stream_k, s.ev_pipe_fork, 0);
                 cudaStreamWaitEvent(s.stream_v, s.ev_pipe_fork, 0);
@@ -458,6 +482,12 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, s.stream_v);
                 cudaEventRecord(s.ev_gdn_ab, s.stream_v);
                 proj_xn(w.wqkv, w.wqkv_type, s.lin_qkv, s.linear_qkvdim, st);
+            } else if (gdn_fused_proj) {
+                kernels::launch_mmvq_gdn_qkv_z_pack2(s.aq81, w.wqkv, w.wqkv_gate,
+                                                       s.lin_qkv, s.lin_z,
+                                                       s.linear_qkvdim, s.linear_vdim, H, st);
+                proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, st);
+                proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, st);
             } else {
                 proj_xn(w.wqkv, w.wqkv_type, s.lin_qkv, s.linear_qkvdim, st);
                 proj_xn(w.wqkv_gate, w.wqkv_gate_type, s.lin_z, s.linear_vdim, st);
@@ -467,11 +497,23 @@ int Qwen35Model::forward_token(int token_id, int position) {
 
             bf16* conv_state = s.lin_conv_state +
                 (size_t)L * (c.linear_conv_kernel - 1) * s.linear_qkvdim;
-            kernels::launch_qwen36_conv_split_l2(s.lin_qkv, w.ssm_conv, conv_state,
+            // Fused conv_split + l2_norm: one kernel instead of three (SPARKINFER_GDN_FUSE=0 restores split).
+            static int gdn_fuse = -1;
+            if (gdn_fuse < 0) { const char* e = getenv("SPARKINFER_GDN_FUSE"); gdn_fuse = (e && e[0] == '0') ? 0 : 1; }
+            if (gdn_fuse && c.linear_head_dim == 128 && c.linear_q_heads == 16 &&
+                c.linear_v_heads == 32) {
+                kernels::launch_qwen36_conv_split_l2norm_fused(s.lin_qkv, w.ssm_conv, conv_state,
                                                  s.lin_q, s.lin_k, s.lin_v,
                                                  c.linear_q_heads, c.linear_v_heads,
                                                  c.linear_head_dim, c.linear_conv_kernel,
                                                  c.rms_eps, st);
+            } else {
+                kernels::launch_qwen36_conv_split_l2(s.lin_qkv, w.ssm_conv, conv_state,
+                                                 s.lin_q, s.lin_k, s.lin_v,
+                                                 c.linear_q_heads, c.linear_v_heads,
+                                                 c.linear_head_dim, c.linear_conv_kernel,
+                                                 c.rms_eps, st);
+            }
             if (gdn_pipelined) cudaStreamWaitEvent(st, s.ev_gdn_ab, 0);
             float* layer_state = s.lin_state +
                 (size_t)L * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
@@ -480,7 +522,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
                                           layer_state, s.lin_gdn,
                                           c.linear_q_heads, c.linear_v_heads,
                                           c.linear_head_dim, st);
-            if (gdn_pipelined) cudaStreamWaitEvent(st, s.ev_gdn_z, 0);
+            if (gdn_pipelined && !gdn_fused_proj) cudaStreamWaitEvent(st, s.ev_gdn_z, 0);
             const bool gdn_gn_q8 = s.gguf && s.use_pq && s.use_llama &&
                                    (w.ssm_out_type == 12 || w.ssm_out_type == 8) &&
                                    c.linear_head_dim == 128;
@@ -659,16 +701,31 @@ int Qwen35Model::forward_token(int token_id, int position) {
                     kernels::launch_gemv_q(s.hn, w.shared_gate_inp, w.shared_gate_inp_type,
                                            s.shared_gate_tmp, 1, H, s.stream_k);
                 } else {
-                    kernels::launch_gemv(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, H, s.stream_k);
+                    // Fused GEMV + sigmoid for the shared-expert gate scalar:
+                    // writes fp32 sigmoid(gate) directly, eliminating the separate
+                    // 1-thread sigmoid_scalar_kernel launch. SPARKINFER_GEMV_SIGMOID=0
+                    // restores the split path for A/B.
+                    static int gemv_sigmoid = -1;
+                    if (gemv_sigmoid < 0) { const char* e = getenv("SPARKINFER_GEMV_SIGMOID");
+                        gemv_sigmoid = (e && e[0] == '1') ? 1 : 0; }   // default off: fused dot != split-k GEMV
+                    if (gemv_sigmoid) {
+                        kernels::launch_gemv_sigmoid(s.hn, w.shared_gate_inp, s.shared_gate_tmp, s.d_shared_w, H, s.stream_k);
+                    } else {
+                        kernels::launch_gemv(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, H, s.stream_k);
+                        kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, s.stream_k);
+                    }
                 }
-                kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, s.stream_k);
             }
             if (qmoe) {
+                // Pipelined shared overlaps stream_k with MoE on st — accum into routed here
+                // races MoE (shared finishes first, MoE overwrites routed). Always write s.shared;
+                // fold happens after both complete. SPARKINFER_SHEXP_ACCUM=1 only applies on the
+                // non-pipelined path where MoE has already landed in routed.
                 kernels::launch_shared_expert_q8_mmvq(
                     s.hn, fnq ? s.aq81 : nullptr,
                     w.shared_gate_q, w.shared_up_q, w.shared_down_q,
                     w.shared_gate_inp ? s.d_shared_w : nullptr,
-                    s.shared, s.sx_h, s.sx_q8, H, c.moe_ffn, s.stream_k);
+                    s.shared, s.sx_h, s.sx_q8, H, c.moe_ffn, s.stream_k, false);
             } else {
                 kernels::launch_gemv(s.hn, w.shared_gate, s.sh_gate, c.moe_ffn, H, s.stream_k);
                 kernels::launch_gemv(s.hn, w.shared_up,   s.sh_up,   c.moe_ffn, H, s.stream_v);
@@ -720,9 +777,10 @@ int Qwen35Model::forward_token(int token_id, int position) {
         }
         const void* shared_to_fold = nullptr;
         if (c.n_shared > 0) {
+            const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
             if (shexp_pipelined) {
                 cudaStreamWaitEvent(st, s.ev_sx_done, 0);
-                const void* nextnorm = (L + 1 < c.n_layers) ? s.w.layers[L + 1].input_norm : s.w.final_norm;
+                // (residual_add folded into add_rmsnorm3 below — #279)
                 if (s.use_addnorm3) {
                     if (fnq)
                         kernels::launch_add_rmsnorm3_q8(s.h, s.routed, s.shared, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
@@ -754,20 +812,41 @@ int Qwen35Model::forward_token(int token_id, int position) {
                     } else if (w.shared_gate_inp_type) {
                         kernels::launch_gemv_q(s.hn, w.shared_gate_inp, w.shared_gate_inp_type, s.shared_gate_tmp, 1, H, st);
                     } else {
-                        kernels::launch_gemv(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, H, st);
+                        static int gs2 = -1;
+                        if (gs2 < 0) { const char* e = getenv("SPARKINFER_GEMV_SIGMOID");
+                            gs2 = (e && e[0] == '1') ? 1 : 0; }
+                        if (gs2) {
+                            kernels::launch_gemv_sigmoid(s.hn, w.shared_gate_inp, s.shared_gate_tmp, s.d_shared_w, H, st);
+                        } else {
+                            kernels::launch_gemv(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, H, st);
+                            kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, st);
+                        }
                     }
                 } else {
                     kernels::launch_gemm(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, 1, H, 1.f, 0.f, gc, st);
+                    kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, st);
                 }
-                kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, st);
             }
             if (s.gguf) {
                 if (qmoe) {
+                    // MoE already wrote routed; safe to accum shared down into it (opt-in).
+                    static int shexp_accum = -1;
+                    if (shexp_accum < 0) { const char* e = getenv("SPARKINFER_SHEXP_ACCUM");
+                        shexp_accum = (e && e[0] == '1') ? 1 : 0; }
+                    const bool sx_accum = shexp_accum != 0;
                     kernels::launch_shared_expert_q8_mmvq(
                         s.hn, fnq ? s.aq81 : nullptr,
                         w.shared_gate_q, w.shared_up_q, w.shared_down_q,
                         w.shared_gate_inp ? s.d_shared_w : nullptr,
-                        s.shared, s.mf_h, s.aq81, H, c.moe_ffn, st);
+                        sx_accum ? s.routed : s.shared, s.mf_h, s.aq81, H, c.moe_ffn, st,
+                        sx_accum);
+                    if (sx_accum) {
+                        if (fnq)
+                            kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
+                        else
+                            kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
+                        continue;
+                    }
                 } else {
                     kernels::launch_gemv(s.hn, w.shared_gate, s.sh_gate, c.moe_ffn, H, st);
                     kernels::launch_gemv(s.hn, w.shared_up,   s.sh_up,   c.moe_ffn, H, st);
@@ -957,6 +1036,21 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (s.cfg.linear_v_heads <= 0) s.cfg.linear_v_heads = 32;
         if (s.cfg.linear_head_dim <= 0) s.cfg.linear_head_dim = 128;
         if (s.cfg.linear_conv_kernel <= 0) s.cfg.linear_conv_kernel = 4;
+    }
+    const bool dense_ffn = g.tensor("blk.0.ffn_gate.weight") != nullptr &&
+                           g.tensor("blk.0.ffn_gate_exps.weight") == nullptr;
+    if (dense_ffn) {
+        s.cfg.dense_ffn = true;
+        s.cfg.n_experts = 1;
+        s.cfg.top_k = 1;
+        s.cfg.n_shared = 0;
+        if (s.cfg.moe_ffn <= 0) {
+            s.cfg.moe_ffn = (int)qwen_moe_meta_int(g, "feed_forward_length", 0);
+            if (s.cfg.moe_ffn <= 0) {
+                if (const GGUFTensor* gate = g.tensor("blk.0.ffn_gate.weight"))
+                    if (gate->n_dims >= 2) s.cfg.moe_ffn = (int)gate->dims[1];
+            }
+        }
     }
     const Qwen35Config& c = s.cfg;
     const int H = c.hidden;
@@ -1152,12 +1246,21 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             w.up_q   = dev_quant(b + "ffn_up.weight", w.up_qtype);
             w.down_q = dev_quant_down(b + "ffn_down.weight", w.down_qtype);
         } else {
-        if (!expect_dims(b + "ffn_gate_inp.weight", {H, c.n_experts})) return false;
-        w.router_w = dense(b + "ffn_gate_inp.weight", false);   // native [E,H] for GEMV
-        w.gate_q = dev_quant(b + "ffn_gate_exps.weight", w.gate_qtype);   // kept quantized
-        w.up_q   = dev_quant(b + "ffn_up_exps.weight",   w.up_qtype);
-        w.down_q = dev_quant(b + "ffn_down_exps.weight", w.down_qtype);
-        if (s.cfg.n_shared > 0) {
+            if (!expect_dims(b + "ffn_gate_inp.weight", {H, c.n_experts})) return false;
+            // Router weight: keep Q8_0 raw if present in the GGUF (half bandwidth, on-read GEMV)
+            {
+                const GGUFTensor* rt = g.tensor(b + "ffn_gate_inp.weight");
+                if (qattn && rt && rt->ggml_type == 8) {
+                    w.router_w = dev_quant(b + "ffn_gate_inp.weight", w.router_w_type);
+                } else {
+                    w.router_w = dense(b + "ffn_gate_inp.weight", false);
+                    w.router_w_type = 0;
+                }
+            }
+            w.gate_q = dev_quant(b + "ffn_gate_exps.weight", w.gate_qtype);   // kept quantized
+            w.up_q   = dev_quant(b + "ffn_up_exps.weight",   w.up_qtype);
+            w.down_q = dev_quant(b + "ffn_down_exps.weight", w.down_qtype);
+            if (s.cfg.n_shared > 0) {
             if (!expect_dims(b + "ffn_gate_shexp.weight", {H, c.moe_ffn}) ||
                 !expect_dims(b + "ffn_up_shexp.weight", {H, c.moe_ffn}) ||
                 !expect_dims(b + "ffn_down_shexp.weight", {c.moe_ffn, H}) ||
@@ -1181,7 +1284,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             const bool have_shared_q = w.shared_gate_q && w.shared_up_q && w.shared_down_q;
             const bool have_shared_d = w.shared_gate && w.shared_up && w.shared_down;
             if (!have_shared_q && !have_shared_d) return false;
-        }
+            }
         }
         const bool have_attn = w.linear_attn
             ? (w.wqkv && w.wqkv_gate && w.ssm_conv && w.ssm_dt && w.ssm_a &&

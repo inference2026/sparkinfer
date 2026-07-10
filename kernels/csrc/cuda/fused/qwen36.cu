@@ -522,19 +522,51 @@ void launch_qwen36_gdn_ar(const void* q_bf16, const void* k_bf16, const void* v_
     // run — the static flag guarantees that. Requires head_dim a multiple of 32 (128 -> NROW=4).
     static int fast = -1;
     if (fast < 0) { const char* e = getenv("SPARKINFER_GDN_FAST"); fast = (e && e[0] == '0') ? 0 : 1; }
-    if (fast && head_dim == 128) {                            // Qwen3.6 linear_head_dim; other dims -> naive
-        constexpr int COLS = 8, HD = 128;                     // 8 warps (columns)/block -> 256 threads
-        dim3 grid(v_heads, (HD + COLS - 1) / COLS);
-        gdn_ar_fast_kernel<COLS, HD><<<grid, COLS * 32, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(q_bf16),
-            reinterpret_cast<const __nv_bfloat16*>(k_bf16),
-            reinterpret_cast<const __nv_bfloat16*>(v_bf16),
-            reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
-            reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
-            reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
-            reinterpret_cast<const __nv_bfloat16*>(a_bf16),
-            state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16),
-            q_heads, v_heads);
+    if (fast && head_dim == 128) {                            // Qwen3.6/Qwythos linear_head_dim=128
+        static int cols = -1;
+        if (cols < 0) {
+            const char* e = getenv("SPARKINFER_GDN_FAST_COLS");
+            if (e) cols = atoi(e);
+            else cols = (v_heads >= 32) ? 4 : 8;              // 32 v-heads -> 1024 blocks @ COLS=4
+            if (!(cols == 4 || cols == 8 || cols == 16)) cols = 8;
+        }
+        constexpr int HD = 128;
+        const int c = cols;
+        dim3 grid(v_heads, (HD + c - 1) / c);
+        if (c == 4) {
+            gdn_ar_fast_kernel<4, HD><<<grid, 4 * 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(k_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(v_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(a_bf16),
+                state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16),
+                q_heads, v_heads);
+        } else if (c == 16) {
+            gdn_ar_fast_kernel<16, HD><<<grid, 16 * 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(k_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(v_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(a_bf16),
+                state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16),
+                q_heads, v_heads);
+        } else {
+            gdn_ar_fast_kernel<8, HD><<<grid, 8 * 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(k_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(v_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(alpha_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(beta_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(dt_bf16),
+                reinterpret_cast<const __nv_bfloat16*>(a_bf16),
+                state_f32, reinterpret_cast<__nv_bfloat16*>(out_bf16),
+                q_heads, v_heads);
+        }
         return;
     }
     static int warpgrid = -1;
@@ -605,6 +637,87 @@ void launch_qwen36_gated_norm_q8(const void* x_bf16, const void* z_bf16,
         v_heads, eps);
 }
 #endif
+
+// ---- fused conv_split + l2_norm (per-head) ----------------------------------
+// Replaces conv_split_kernel + 2× l2_norm_heads_kernel with a single per-head
+// kernel. One block per head (64 blocks = 16q + 16k + 32v) with head_dim
+// threads. Each thread processes one dimension: 1D depthwise conv, SiLU,
+// then l2_norm (q/k heads only). Eliminates two kernel launches and the
+// intermediate non-normalized q/k global writes. SKIP_FUSED_CONV_L2NORM=1
+// restores the split path for A/B.
+__global__ void conv_split_l2norm_fused_kernel(
+    const __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ conv_w,
+    __nv_bfloat16* __restrict__ conv_state,
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    __nv_bfloat16* __restrict__ v,
+    int q_heads, int v_heads, int head_dim, int conv_kernel, float eps)
+{
+    const int h  = blockIdx.x;
+    const int t  = threadIdx.x;
+    const int q_dim = q_heads * head_dim;
+    const int v_dim = v_heads * head_dim;
+    const int qkv_dim = 2 * q_dim + v_dim;
+
+    bool do_norm = false;
+    int d;
+    __nv_bfloat16* out;
+    if (h < q_heads) {
+        d = h * head_dim + t;  out = q + d;           do_norm = true;
+    } else if (h < 2 * q_heads) {
+        d = q_dim + (h - q_heads) * head_dim + t;  out = k + d - q_dim;  do_norm = true;
+    } else {
+        d = 2 * q_dim + (h - 2 * q_heads) * head_dim + t;  out = v + d - 2 * q_dim;
+    }
+    if (d >= qkv_dim) return;
+
+    // 1D conv + SiLU
+    float y = 0.f;
+    for (int p = 0; p < conv_kernel - 1; p++)
+        y += q36_to_f(conv_state[(size_t)p * qkv_dim + d]) *
+             q36_to_f(conv_w[(size_t)d * conv_kernel + p]);
+    y += q36_to_f(qkv[d]) * q36_to_f(conv_w[(size_t)d * conv_kernel + (conv_kernel - 1)]);
+
+    for (int p = 0; p < conv_kernel - 2; p++)
+        conv_state[(size_t)p * qkv_dim + d] = conv_state[(size_t)(p + 1) * qkv_dim + d];
+    if (conv_kernel > 1)
+        conv_state[(size_t)(conv_kernel - 2) * qkv_dim + d] = qkv[d];
+
+    const float oy = q36_silu(y);
+
+    if (do_norm) {
+        const float ss = q36_wsum(oy * oy);
+        __shared__ float sw[32];
+        if ((t & 31) == 0) sw[t >> 5] = ss;
+        __syncthreads();
+        if (t < 32) {
+            float vv = (t < (head_dim + 31) / 32) ? sw[t] : 0.f;
+            vv = q36_wsum(vv);
+            if (t == 0) sw[0] = rsqrtf(vv + eps);
+        }
+        __syncthreads();
+        out[0] = __float2bfloat16(oy * sw[0]);
+    } else {
+        out[0] = __float2bfloat16(oy);
+    }
+}
+
+void launch_qwen36_conv_split_l2norm_fused(
+    const void* qkv_bf16, const void* conv_w_bf16,
+    void* conv_state_bf16, void* q_bf16, void* k_bf16,
+    void* v_bf16, int q_heads, int v_heads, int head_dim,
+    int conv_kernel, float eps, cudaStream_t stream)
+{
+    conv_split_l2norm_fused_kernel<<<2 * q_heads + v_heads, head_dim, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(qkv_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(conv_w_bf16),
+        reinterpret_cast<__nv_bfloat16*>(conv_state_bf16),
+        reinterpret_cast<__nv_bfloat16*>(q_bf16),
+        reinterpret_cast<__nv_bfloat16*>(k_bf16),
+        reinterpret_cast<__nv_bfloat16*>(v_bf16),
+        q_heads, v_heads, head_dim, conv_kernel, eps);
+}
 
 } // namespace kernels
 } // namespace sparkinfer
