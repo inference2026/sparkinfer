@@ -332,6 +332,23 @@ int Qwen35Model::forward_token(int token_id, int position) {
         if ((long)seqlen > 2L * s.split_chunk)  want = 128;
         if ((long)seqlen > 32L * s.split_chunk) want = 256;
         if (want > Impl::MAX_NSPLITS) want = Impl::MAX_NSPLITS;
+        // hd256/GQA-8 occupancy correction (Qwen3.6 full-attention shape specifically): the
+        // generic 128/256 thresholds above were tuned around the split kernel's assumed
+        // occupancy, but fa_split_gqa_mma_i8_kernel<HEAD_DIM,GQA> is a single template shared
+        // by hd128 and hd256 under the SAME __launch_bounds__(GQA*32, 5) hint — hd256's smem
+        // footprint is ~1.9x hd128's (i8_smem ~33KB vs ~17KB for GQA=8), so its REAL achieved
+        // occupancy is lower than the 5 blocks/SM the generic policy assumes, meaning the split
+        // grid is systematically over-subscribed at this shape. Empirically re-measured (RTX
+        // 5090, same-box A/B, 4k/8k/16k/32k): a flat 160 beats both the 128 and 256 tiers at
+        // every measured point (+2.8% @16k, +4.9% @32k, +3.2% @8k, tied @4k), confirmed
+        // byte-safe (online-softmax combine is exact for any split count; verified top-1=100%,
+        // KL~equal to baseline vs a real llama.cpp reference at 120 sampled 8k-32k positions).
+        // Gated strictly to Qwen3.6's exact full-attention config (hd256, 8:1 GQA) so Qwythos
+        // (hd256, 4:1 GQA) and Qwen3-30B (hd128) keep the untouched generic policy above.
+        if (c.head_dim == 256 && c.n_kv_heads > 0 && c.n_q_heads == c.n_kv_heads * 8
+            && (long)seqlen > 2L * s.split_chunk) {
+            want = 160;
+        }
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
             if (s.graph_ready) {
