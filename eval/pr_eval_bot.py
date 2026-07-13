@@ -371,12 +371,24 @@ def flag_copycat(repo, num, original, author):
             f"See [`.github/COPYCATS.md`](../blob/main/.github/COPYCATS.md).")
     gh(["pr", "comment", str(num), "-R", repo, "--body", body])
 
+def _evaluated_commit_from_comment(body):
+    """Return commit oid if a PR comment records a completed eval verdict, else None.
+
+    Error posts reuse the eval marker but lack the verdict header — they must not block re-runs."""
+    if not body or "auto-eval errored" in body:
+        return None
+    m = re.search(r"<!-- sparkinfer-eval:([0-9a-f]+) -->", body)
+    if not m or "sparkinfer auto-eval —" not in body:
+        return None
+    return m.group(1)
+
 def evaluated_commits(repo, num):
     r = gh(["pr", "view", str(num), "-R", repo, "--json", "comments"])
     done = set()
     for c in json.loads(r.stdout or "{}").get("comments", []):
-        for m in re.finditer(r"<!-- sparkinfer-eval:([0-9a-f]+) -->", c.get("body", "")):
-            done.add(m.group(1))
+        oid = _evaluated_commit_from_comment(c.get("body", ""))
+        if oid:
+            done.add(oid)
     return done
 
 def areas_for_pr(repo, num):
@@ -1765,7 +1777,7 @@ def main():
         if not line:
             log = (r.stdout + r.stderr)[-1500:]
             print(f"PR #{num}: eval produced no result\n{log}")
-            body = (f"<!-- sparkinfer-eval:{oid} -->\n⚠️ **sparkinfer auto-eval errored** for `{oid}` "
+            body = (f"<!-- sparkinfer-eval-error:{oid} -->\n⚠️ **sparkinfer auto-eval errored** for `{oid}` "
                     f"— re-run manually.\n\n<details><summary>log tail</summary>\n\n```\n{log}\n```\n</details>")
             res, label = None, None
         else:

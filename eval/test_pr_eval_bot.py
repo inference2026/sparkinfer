@@ -356,6 +356,31 @@ class PrEvalBotPolicyTest(unittest.TestCase):
         self.assertEqual(closed, {99})
         gh_mock.assert_called_once()
 
+    def test_evaluated_commit_from_comment_accepts_verdict(self):
+        body = bot.render({"label": "S", "pass": True, "tps": 200.0, "top1": 1.0, "kl": 0.0}, "df74674")
+        self.assertEqual(bot._evaluated_commit_from_comment(body), "df74674")
+
+    def test_evaluated_commit_from_comment_rejects_error_marker(self):
+        body = ("<!-- sparkinfer-eval:df74674 -->\n"
+                "⚠️ **sparkinfer auto-eval errored** for `df74674` — re-run manually.")
+        self.assertIsNone(bot._evaluated_commit_from_comment(body))
+
+    def test_evaluated_commit_from_comment_rejects_error_marker_v2(self):
+        body = ("<!-- sparkinfer-eval-error:df74674 -->\n"
+                "⚠️ **sparkinfer auto-eval errored** for `df74674` — re-run manually.")
+        self.assertIsNone(bot._evaluated_commit_from_comment(body))
+
+    def test_evaluated_commits_ignores_errored_comments(self):
+        comments = [
+            {"body": "<!-- sparkinfer-eval:df74674 -->\n⚠️ **sparkinfer auto-eval errored**"},
+            {"body": bot.render({"label": "REJECT", "pass": False, "reason": "x",
+                                 "tps": 0, "top1": 0, "kl": 0}, "abc1234")},
+        ]
+        gh_mock = mock.Mock(return_value=mock.Mock(stdout=json.dumps({"comments": comments})))
+        with mock.patch.object(bot, "gh", gh_mock):
+            done = bot.evaluated_commits("gittensor-ai-lab/sparkinfer", 379)
+        self.assertEqual(done, {"abc1234"})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
