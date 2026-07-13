@@ -4013,7 +4013,7 @@
     "frontier_tps": 298.27,
     "baseline_tps": 298.27,
     "ref_name": "llama.cpp",
-    "ref_tps": 224.91,
+    "ref_tps": 220.84,
     "token_match": 0.9613,
     "kl": 0.0141,
     "note": "same-box baseline 91.224.44.227 (KV cap fix, origin/main + kMaxBlocksPerSeq=10240, 2026-07-13)",
@@ -4022,31 +4022,31 @@
         "label": "128",
         "color": "#D14D72",
         "tps": 298.27,
-        "ref_tps": 224.91
+        "ref_tps": 220.84
       },
       {
         "label": "4k",
         "color": "#0E8A16",
         "tps": 282.97,
-        "ref_tps": 224.68
+        "ref_tps": 221.8
       },
       {
         "label": "32k",
         "color": "#6F42C1",
         "tps": 242.03,
-        "ref_tps": 0
+        "ref_tps": 221.11
       },
       {
         "label": "64k",
         "color": "#E67E22",
         "tps": 204.56,
-        "ref_tps": 0
+        "ref_tps": 220.54
       },
       {
         "label": "128k",
         "color": "#17A2B8",
         "tps": 159.19,
-        "ref_tps": 0
+        "ref_tps": 220.58
       }
     ]
   },

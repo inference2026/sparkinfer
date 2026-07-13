@@ -655,11 +655,11 @@ CTX_SERIES = {
 # Qwen3.5 (Qwythos) per-context llama.cpp anchors — colors match CTX_SERIES.
 Q35_CTX_ORDER = ("128", "4k", "32k", "64k", "128k")
 Q35_CTX_SERIES = {
-    128:    {"label": "128",  "ref_tps": 224.91},
-    4096:   {"label": "4k",   "ref_tps": 224.68},
-    32768:  {"label": "32k",  "ref_tps": 0},
-    65536:  {"label": "64k",  "ref_tps": 0},
-    131072: {"label": "128k", "ref_tps": 0},
+    128:    {"label": "128",  "ref_tps": 220.84},
+    4096:   {"label": "4k",   "ref_tps": 221.80},
+    32768:  {"label": "32k",  "ref_tps": 221.11},
+    65536:  {"label": "64k",  "ref_tps": 220.54},
+    131072: {"label": "128k", "ref_tps": 220.58},
 }
 Q36_CTX_ORDER = ("128", "512", "4k", "16k", "32k")
 # Qwen3.6-35B-A3B llama.cpp decode refs (RTX 5090) — pinned in bench/scripts/reference.lock
