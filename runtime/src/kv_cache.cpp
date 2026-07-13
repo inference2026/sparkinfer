@@ -22,7 +22,7 @@ inline void cu(cudaError_t e, const char* what) {
     if (e != cudaSuccess) fprintf(stderr, "[kv] %s: %s\n", what, cudaGetErrorString(e));
 }
 constexpr int kMaxSeqs = 256;
-constexpr int kMaxBlocksPerSeq = 4096;   // 4096 * block_size tokens per sequence
+constexpr int kMaxBlocksPerSeq = 10240;  // 10240 * 16 = 163840 tokens (128k ctx + decode headroom)
 }
 
 struct KVCacheManager::Impl {
