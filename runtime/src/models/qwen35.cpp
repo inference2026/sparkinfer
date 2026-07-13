@@ -1241,7 +1241,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     const std::string attn_requant_mode =
         attn_env ? std::string(attn_env)
                  : (q35_dense9b_requant_default ? std::string("qkv")
-                    : (q36_ud_requant_default ? std::string("attn_q,attn_output") : std::string()));
+                    : (q36_ud_requant_default ? std::string("attn_q,attn_output,qkv,attn_gate") : std::string()));
     auto mode_token = [&](const char* want) {
         const std::string w(want);
         size_t p = 0;
@@ -1325,6 +1325,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if ((mode_token("k") || mode_token("attn_k")) && has_suffix(name, "attn_k.weight")) return true;
         if ((mode_token("o") || mode_token("out") || mode_token("attn_output")) &&
             has_suffix(name, "attn_output.weight")) return true;
+        // Qwen3.6 GDN input projections ship Q8_0 (the single largest per-token weight read):
+        // attn_qkv (wqkv, handled by the "qkv" token above) + attn_gate (the z gate). Requant
+        // both to Q4_K so they route through the existing Q4_K fused GDN qkv+z kernel (~47% fewer
+        // bytes). SPARKINFER_ATTN_REQUANT_Q4K=attn_q,attn_output restores the #353-only behavior.
+        if (mode_token("attn_gate") && has_suffix(name, "attn_gate.weight")) return true;
         return false;
     };
     const bool req_lm_q4 = env_enabled("SPARKINFER_LMHEAD_REQUANT_Q4K", q35_dense9b_requant_default);
