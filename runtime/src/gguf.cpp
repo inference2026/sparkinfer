@@ -6,10 +6,18 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#endif
 
 namespace sparkinfer {
 
@@ -43,16 +51,100 @@ void block_info(int t, long& bytes, long& elems) {
         default: bytes=0;   elems=1;   break;
     }
 }
+
+#ifdef _WIN32
+bool map_readonly(const std::string& path, void*& base, size_t& size,
+                  void*& file_handle, void*& map_handle) {
+    file_handle = (void*)CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                     nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file_handle == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "[gguf] open failed: %s\n", path.c_str());
+        return false;
+    }
+    LARGE_INTEGER li{};
+    if (!GetFileSizeEx((HANDLE)file_handle, &li) || li.QuadPart <= 0) {
+        fprintf(stderr, "[gguf] stat failed: %s\n", path.c_str());
+        CloseHandle((HANDLE)file_handle);
+        file_handle = INVALID_HANDLE_VALUE;
+        return false;
+    }
+    size = (size_t)li.QuadPart;
+    map_handle = (void*)CreateFileMappingA((HANDLE)file_handle, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!map_handle) {
+        fprintf(stderr, "[gguf] CreateFileMapping failed\n");
+        CloseHandle((HANDLE)file_handle);
+        file_handle = INVALID_HANDLE_VALUE;
+        return false;
+    }
+    base = MapViewOfFile((HANDLE)map_handle, FILE_MAP_READ, 0, 0, 0);
+    if (!base) {
+        fprintf(stderr, "[gguf] MapViewOfFile failed\n");
+        CloseHandle((HANDLE)map_handle);
+        CloseHandle((HANDLE)file_handle);
+        map_handle = nullptr;
+        file_handle = INVALID_HANDLE_VALUE;
+        return false;
+    }
+    return true;
+}
+
+void unmap_readonly(void* base, void* file_handle, void* map_handle) {
+    if (base) UnmapViewOfFile(base);
+    if (map_handle) CloseHandle((HANDLE)map_handle);
+    if (file_handle && file_handle != INVALID_HANDLE_VALUE) CloseHandle((HANDLE)file_handle);
+}
+#else
+bool map_readonly(const std::string& path, void*& base, size_t& size, int& fd) {
+    fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "[gguf] open failed: %s\n", path.c_str()); return false; }
+    struct stat st{};
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        fprintf(stderr, "[gguf] stat failed: %s\n", path.c_str());
+        close(fd);
+        fd = -1;
+        return false;
+    }
+    size = (size_t)st.st_size;
+    base = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (base == MAP_FAILED) {
+        fprintf(stderr, "[gguf] mmap failed\n");
+        close(fd);
+        fd = -1;
+        base = nullptr;
+        return false;
+    }
+    return true;
+}
+
+void unmap_readonly(void* base, size_t size, int fd) {
+    if (base && base != MAP_FAILED) munmap(base, size);
+    if (fd >= 0) close(fd);
+}
+#endif
 } // namespace
 
-GGUF::~GGUF() { if (base_ && base_ != MAP_FAILED) munmap(base_, size_); if (fd_ >= 0) close(fd_); }
+GGUF::~GGUF() {
+#ifdef _WIN32
+    unmap_readonly(base_, win_file_, win_map_);
+#else
+    unmap_readonly(base_, size_, fd_);
+#endif
+    base_ = nullptr;
+    size_ = 0;
+#ifdef _WIN32
+    win_file_ = (void*)(intptr_t)-1;
+    win_map_ = nullptr;
+#else
+    fd_ = -1;
+#endif
+}
 
 bool GGUF::open(const std::string& path) {
-    fd_ = ::open(path.c_str(), O_RDONLY);
-    if (fd_ < 0) { fprintf(stderr, "[gguf] open failed: %s\n", path.c_str()); return false; }
-    struct stat st; fstat(fd_, &st); size_ = st.st_size;
-    base_ = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
-    if (base_ == MAP_FAILED) { fprintf(stderr, "[gguf] mmap failed\n"); return false; }
+#ifdef _WIN32
+    if (!map_readonly(path, base_, size_, win_file_, win_map_)) return false;
+#else
+    if (!map_readonly(path, base_, size_, fd_)) return false;
+#endif
 
     Cursor c{ (const uint8_t*)base_, 0, size_ };
     char magic[4]; memcpy(magic, c.p, 4); c.off = 4;

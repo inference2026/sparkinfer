@@ -1,7 +1,7 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <unordered_map>
-#include <cstdint>
 
 namespace sparkinfer {
 
@@ -28,7 +28,12 @@ public:
     const GGUFTensor* tensor(const std::string& name) const;
 
 private:
+#ifndef _WIN32
     int    fd_ = -1;
+#else
+    void*  win_file_ = (void*)(intptr_t)-1;
+    void*  win_map_  = nullptr;
+#endif
     void*  base_ = nullptr;
     size_t size_ = 0;
     std::unordered_map<std::string, long>        ints_;
