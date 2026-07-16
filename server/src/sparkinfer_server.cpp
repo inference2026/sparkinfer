@@ -89,6 +89,14 @@ std::string random_id() {
     return ss.str();
 }
 
+std::string usage_json(int prompt_tokens, int completion_tokens) {
+    std::ostringstream o;
+    const int total = prompt_tokens + completion_tokens;
+    o << "\"usage\":{\"prompt_tokens\":" << prompt_tokens << ",\"completion_tokens\":" << completion_tokens
+      << ",\"total_tokens\":" << total << "}";
+    return o.str();
+}
+
 bool auth_ok(const httplib::Request& req) {
     if (g_api_key.empty()) return true;
     auto it = req.headers.find("Authorization");
@@ -283,6 +291,14 @@ int main(int argc, char** argv) {
                                            << "\"}}\n\n";
                                  sink.write(err_chunk.str().c_str(), (size_t)err_chunk.str().size());
                              }
+                             const int prompt_tokens = (int)prompt_ids.size();
+                             const int completion_tokens = (int)stream_ids.size();
+                             std::ostringstream usage_chunk;
+                             usage_chunk << "data: {\"id\":\"" << cid << "\",\"object\":\"chat.completion.chunk\","
+                                         << "\"created\":" << created << ",\"model\":\"" << g_model_name << "\","
+                                         << "\"choices\":[],"
+                                         << usage_json(prompt_tokens, completion_tokens) << "}\n\n";
+                             sink.write(usage_chunk.str().c_str(), (size_t)usage_chunk.str().size());
                              std::string tail =
                                  "data: {\"id\":\"" + cid +
                                  "\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,"
@@ -319,7 +335,8 @@ int main(int argc, char** argv) {
                  if (!parsed.reasoning_content.empty())
                      body << ",\"reasoning_content\":\"" << json_escape(parsed.reasoning_content) << "\"";
                  body << ",\"content\":\"" << json_escape(parsed.content) << "\""
-                      << "},\"finish_reason\":\"stop\"}]}";
+                      << "},\"finish_reason\":\"stop\"}],"
+                      << usage_json((int)prompt_ids.size(), (int)gen.size()) << "}";
                  res.set_content(body.str(), "application/json");
              });
 
