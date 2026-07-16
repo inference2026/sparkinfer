@@ -396,9 +396,8 @@ __global__ void gated_norm_warp_kernel(const __nv_bfloat16* __restrict__ x,
         out[base + t] = __float2bfloat16(xv[r] * inv * wv[r] * q36_silu(zv[r]));
     }
 }
-template __global__ void gated_norm_warp_kernel<128>(const __nv_bfloat16*, const __nv_bfloat16*,
-    const __nv_bfloat16*, __nv_bfloat16*, int, float);
-
+SPARKINFER_KERNEL_INST(template __global__ void gated_norm_warp_kernel<128>(const __nv_bfloat16*, const __nv_bfloat16*,
+    const __nv_bfloat16*, __nv_bfloat16*, int, float);)
 struct si_blk_q8_1 { __half2 ds; signed char qs[32]; };
 
 // Gated norm then Q8_1 from bf16-rounded values — bit-identical to gated_norm + quantize_q8_1_blocks.
@@ -441,9 +440,8 @@ __global__ void gated_norm_q8_warp_kernel(const __nv_bfloat16* __restrict__ x,
         if (lane == 0) out_q8[qbase + r].ds = __floats2half2_rn(d, d * (float)s);
     }
 }
-template __global__ void gated_norm_q8_warp_kernel<128>(const __nv_bfloat16*, const __nv_bfloat16*,
-    const __nv_bfloat16*, si_blk_q8_1*, int, float);
-
+SPARKINFER_KERNEL_INST(template __global__ void gated_norm_q8_warp_kernel<128>(const __nv_bfloat16*, const __nv_bfloat16*,
+    const __nv_bfloat16*, si_blk_q8_1*, int, float);)
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/fused.h"
 

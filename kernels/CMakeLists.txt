@@ -19,6 +19,12 @@ option(BUILD_CUTE_KERNELS  "Experimental CuTe DSL kernels (needs CUTLASS)" OFF)
 
 include_directories(include)
 
+if(MSVC)
+  # Force-include cuda_compat.h so SPARKINFER_KERNEL_INST wraps explicit inst lines.
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/FI${CMAKE_CURRENT_SOURCE_DIR}/include/sparkinfer/kernels/cuda_compat.h>)
+endif()
+
 # --- Portable CUDA kernel domains (production path, runs on sm_120) ---
 add_subdirectory(csrc/cuda/attention)   # flash decode variants (GQA, hd256, hd512)
 add_subdirectory(csrc/cuda/gemm)        # GEMM, GEMV, batched GEMM

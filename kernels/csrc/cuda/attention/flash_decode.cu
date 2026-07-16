@@ -95,16 +95,15 @@ __global__ void flash_decode_kernel(
 
 // Explicit instantiations — force kernel emission (into the static lib for the
 // real build, and into PTX so NVRTC verification actually checks the body).
-template __global__ void flash_decode_kernel<__nv_bfloat16, 64>(
+SPARKINFER_KERNEL_INST(template __global__ void flash_decode_kernel<__nv_bfloat16, 64>(
     const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
-    const int*, const int*, __nv_bfloat16*, float, int, int, int, int);
-template __global__ void flash_decode_kernel<__nv_bfloat16, 128>(
+    const int*, const int*, __nv_bfloat16*, float, int, int, int, int);)
+SPARKINFER_KERNEL_INST(template __global__ void flash_decode_kernel<__nv_bfloat16, 128>(
     const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
-    const int*, const int*, __nv_bfloat16*, float, int, int, int, int);
-template __global__ void flash_decode_kernel<__nv_bfloat16, 256>(
+    const int*, const int*, __nv_bfloat16*, float, int, int, int, int);)
+SPARKINFER_KERNEL_INST(template __global__ void flash_decode_kernel<__nv_bfloat16, 256>(
     const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
-    const int*, const int*, __nv_bfloat16*, float, int, int, int, int);
-
+    const int*, const int*, __nv_bfloat16*, float, int, int, int, int);)
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 template <int HEAD_DIM>
 static void dispatch(const void* q, const void* k_pool, const void* v_pool,

@@ -35,8 +35,7 @@ __global__ void router_gemm_kernel(
     if (row < M && col < N) logits[(size_t)row * N + col] = acc;
 }
 
-template __global__ void router_gemm_kernel<16>(const __nv_bfloat16*, const __nv_bfloat16*, float*, int, int, int);
-
+SPARKINFER_KERNEL_INST(template __global__ void router_gemm_kernel<16>(const __nv_bfloat16*, const __nv_bfloat16*, float*, int, int, int);)
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/moe.h"
 
