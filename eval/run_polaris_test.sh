@@ -14,7 +14,6 @@ python3 eval/vast_eval.py \
   --ref origin/main \
   --frontier 0 --ceiling "${CEILING:-366}" \
   --eval-mode longctx \
-  --keep \
   2>&1 | tee "$LOG"
 
 # If eval succeeded, run TDX attest on the POLARIS_ATTESTATION line (same as pr_eval_bot).

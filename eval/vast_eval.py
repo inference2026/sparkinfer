@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
-"""Automatic evaluation on a vast.ai GPU: provision (or reuse) → build/correctness/speed → label → teardown.
+"""Automatic evaluation on a vast.ai GPU: reuse an existing box → build/correctness/speed → label.
 
 Requires VAST_API_KEY (`vastai set api-key <key>`). The numeric label is computed on-box by
 bench/scripts/label.py (deterministic) — this script only orchestrates.
 
-  # reuse an existing box (started if stopped, STOPPED again after the eval — the default):
+  # reuse an existing box (started if stopped; left running after eval by default):
   python eval/vast_eval.py --reuse 42134865 --frontier 164 --ceiling 366 --ref main
 
-  # fixed SSH box (EVAL_TRANSPORT=ssh — does not rent from vast.ai):
+  # fixed SSH box (EVAL_TRANSPORT=ssh — does not contact vast.ai):
   python eval/vast_eval.py --ssh 91.224.44.227:50200 --frontier 164 --ceiling 366 --ref main
 
-By default the vast instance is STOPPED after every eval. With --ssh the fixed box is left running.
-
-Self-healing: on --reuse, if the box won't become SSH-ready within --reuse-timeout (default 2 min),
-it is stopped and a fresh box is provisioned via the vast API automatically; the new id is saved to
-~/.sparkinfer_vast_instance (VAST_INSTANCE_FILE) so the next run reuses it. --no-recreate disables this.
+By default the vast instance is LEFT RUNNING after eval. Pass --stop to pause billing.
+Auto-rent is disabled: pass --reuse <id>. Opt in to legacy auto-provision with --allow-provision.
 
 Env: VAST_API_KEY, SSH_KEY, EVAL_TRANSPORT (vast|ssh), EVAL_SSH_HOST, EVAL_SSH_PORT, EVAL_REPO, VAST_INSTANCE_FILE.
 """
@@ -47,11 +44,8 @@ _DEFAULT_SKIP = "94.177.17.69,120.238.149.205,192.3.91.246,47.253.144.202,175.12
 SKIP_HOSTS_PERMANENT = set(filter(None, os.environ.get("VAST_SKIP_HOSTS", _DEFAULT_SKIP).split(",")))
 
 # --pinned: reuse a stable, known-good box (cached model, good download speed) as the default and
-# NEVER destroy it. If it exists but can't be brought up within --reuse-timeout, provision a fresh
-# box right away (default REUSE_MAX_RETRIES=0) and re-pin — stopped vast boxes that won't resume
-# (host busy) would otherwise STALL a manual run, which has no scheduled retry to fall back on. Set
-# VAST_REUSE_MAX_RETRIES>0 to instead wait across that-many scheduled runs before provisioning.
-# Counter persists in REUSE_RETRY_FILE across runs.
+# NEVER destroy it. If it can't be brought up within --reuse-timeout, exit PINNED_RETRY_RC so the
+# bot retries on the next scheduled run (no auto-rent).
 REUSE_RETRY_FILE = os.path.expanduser(os.environ.get("VAST_REUSE_RETRY_FILE", "~/.sparkinfer_reuse_retries"))
 REUSE_MAX_RETRIES = int(os.environ.get("VAST_REUSE_MAX_RETRIES", "0"))
 PINNED_RETRY_RC = 75   # distinct exit code: "pinned box not up; retry on the next run" (not an error)
@@ -312,6 +306,11 @@ def main():
     ap.add_argument("--p35-guard-32k-pp-baseline", type=float, default=0, help="[--bidir] Qwen3.5 main 32k prefill pp tok/s")
     ap.add_argument("--p35-guard-64k-pp-baseline", type=float, default=0, help="[--bidir] Qwen3.5 main 64k prefill pp tok/s")
     ap.add_argument("--p35-guard-128k-pp-baseline", type=float, default=0, help="[--bidir] Qwen3.5 main 128k prefill pp tok/s")
+    ap.add_argument("--p36-guard-128-pp-baseline", type=float, default=0, help="[--bidir] Qwen3.6 main 128 prefill pp tok/s")
+    ap.add_argument("--p36-guard-512-pp-baseline", type=float, default=0, help="[--bidir] Qwen3.6 main 512 prefill pp tok/s")
+    ap.add_argument("--p36-guard-4k-pp-baseline", type=float, default=0, help="[--bidir] Qwen3.6 main 4k prefill pp tok/s")
+    ap.add_argument("--p36-guard-16k-pp-baseline", type=float, default=0, help="[--bidir] Qwen3.6 main 16k prefill pp tok/s")
+    ap.add_argument("--p36-guard-32k-pp-baseline", type=float, default=0, help="[--bidir] Qwen3.6 main 32k prefill pp tok/s")
     ap.add_argument("--g35-guard-128-baseline", type=float, default=0, help="[--bidir] Qwen3.5 guard 128-token tok/s")
     ap.add_argument("--g35-guard-4k-baseline",  type=float, default=0, help="[--bidir] Qwen3.5 guard 4k-context tok/s")
     ap.add_argument("--g35-guard-32k-baseline", type=float, default=0, help="[--bidir] Qwen3.5 guard 32k-context tok/s")
@@ -334,14 +333,17 @@ def main():
     ap.add_argument("--reuse", type=int, default=0)
     ap.add_argument("--ssh", default="", metavar="HOST:PORT",
                     help="fixed SSH eval box (EVAL_TRANSPORT=ssh); vast.ai path unchanged when omitted")
-    ap.add_argument("--keep", action="store_true", help="leave the instance running after eval (default: stop it)")
+    ap.add_argument("--stop", action="store_true",
+                    help="stop the vast instance after eval (default: leave running)")
     ap.add_argument("--destroy", action="store_true", help="destroy after eval instead of stopping (also frees the disk)")
     ap.add_argument("--gpu", default="RTX_5090")
     ap.add_argument("--image", default=IMAGE)
     ap.add_argument("--reuse-timeout", type=int, default=300, help="seconds to wait for a reused box before recreating (default 300 = 5 min; a cold start of a stopped cached box can take minutes — destroying it prematurely wastes the 17GB cache)")
     ap.add_argument("--new-timeout", type=int, default=480, help="seconds to wait for a freshly created box (default 480 = 8 min)")
-    ap.add_argument("--no-recreate", action="store_true", help="on reuse failure, error out instead of provisioning a new box")
-    ap.add_argument("--pinned", action="store_true", help="the --reuse box is the stable default: NEVER destroy it; on bring-up failure exit PINNED_RETRY_RC for up to REUSE_MAX_RETRIES runs before provisioning a new box (pinned kept)")
+    ap.add_argument("--allow-provision", action="store_true",
+                    help="auto-rent/destroy/recreate vast instances on failure (legacy; off by default)")
+    ap.add_argument("--pinned", action="store_true",
+                    help="the --reuse box is stable: never destroy; on bring-up failure exit PINNED_RETRY_RC")
     ap.add_argument("--destroy-on-error", action="store_true", help="destroy (not just stop) the instance if the eval produces no result")
     ap.add_argument("--polaris", action="store_true",
                     help="generate a Polaris verifiable receipt (default: on)")
@@ -376,7 +378,6 @@ def main():
         if not wait_ssh(host, port, tries=12):
             sys.exit(f"SSH box root@{host}:{port} not reachable")
         print(f">> bare-metal eval box: ssh root@{host}:{port}")
-        args.keep = True  # never stop a fixed box
     else:
         from vastai import VastAI
         v = VastAI()
@@ -385,33 +386,28 @@ def main():
             print(f">> vast.ai transport: funds ${bal:.2f} (balance + credit)")
 
     if not bare_metal:
-        # --- vast.ai: reuse / provision / bring-up (unchanged) ---
-        # 1) Try to bring up the reused box within a bounded window (default 5 min).
+        if not iid and not args.allow_provision:
+            sys.exit("vast.ai: pass --reuse <instance_id> (auto-rent disabled; use --allow-provision to opt in)")
+
+        # 1) Bring up the reused box within a bounded window (default 5 min).
         if iid:
             ep = bring_up(v, iid, args.reuse_timeout)
             if ep:
                 host, port = ep
                 if args.pinned:
                     _set_reuse_retries(0)
-            elif args.no_recreate:
-                sys.exit(f"instance {iid} never came up (--no-recreate)")
             elif args.pinned:
                 if info_of(v, iid) is None:
-                    print(f">> pinned instance {iid} no longer exists (vast reclaimed it) — "
-                          f"provisioning a fresh box now.")
-                    _set_reuse_retries(0)
-                    iid = 0
-                else:
-                    n = _reuse_retries() + 1
-                    if n <= REUSE_MAX_RETRIES:
-                        _set_reuse_retries(n)
-                        print(f">> pinned instance {iid} exists but not SSH-ready within {args.reuse_timeout}s "
-                              f"(miss {n}/{REUSE_MAX_RETRIES}) — leaving it intact; retry on the next scheduled run.")
-                        sys.exit(PINNED_RETRY_RC)
-                    _set_reuse_retries(0)
-                    print(f">> pinned instance {iid} unavailable after {REUSE_MAX_RETRIES} retries — "
-                          f"provisioning a NEW box (pinned {iid} kept, NOT destroyed).")
-                    iid = 0
+                    sys.exit(f"pinned instance {iid} no longer exists — start or re-pin manually")
+                n = _reuse_retries() + 1
+                if n <= REUSE_MAX_RETRIES:
+                    _set_reuse_retries(n)
+                    print(f">> pinned instance {iid} exists but not SSH-ready within {args.reuse_timeout}s "
+                          f"(miss {n}/{REUSE_MAX_RETRIES}) — leaving it intact; retry on the next scheduled run.")
+                    sys.exit(PINNED_RETRY_RC)
+                sys.exit(f"pinned instance {iid} unavailable after {REUSE_MAX_RETRIES} retries — start it manually")
+            elif not args.allow_provision:
+                sys.exit(f"instance {iid} never came up — start it on vast.ai or pass --allow-provision")
             else:
                 stuck_host = (info_of(v, iid) or {}).get("public_ipaddr")
                 print(f">> reused instance {iid} is dead/stuck — destroying it and provisioning a new box")
@@ -421,9 +417,8 @@ def main():
                     print("  destroy:", str(e)[:150])
                 iid = 0
 
-        # 2) No working box yet → create one, retrying on different hosts if needed.
-        stuck_host = None
-        if not iid:
+        # 2) Legacy auto-rent path (--allow-provision only).
+        if not iid and args.allow_provision:
             skip = set()
             MAX_ATTEMPTS = 8
             for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -447,10 +442,13 @@ def main():
                 if attempt == MAX_ATTEMPTS:
                     sys.exit(f"all {MAX_ATTEMPTS} provision attempts failed — giving up")
 
+        if not host:
+            sys.exit("no SSH endpoint for vast.ai eval")
+
         save_instance(iid)
-        if args.reuse and iid != args.reuse:
+        if args.allow_provision and args.reuse and iid != args.reuse:
             print(f"NEW_INSTANCE_ID {iid}")
-            print(f">> switched to fresh instance {iid} (old {args.reuse} stopped; destroy it if unneeded)")
+            print(f">> switched to fresh instance {iid} (old {args.reuse}; destroy it if unneeded)")
 
     MODEL_PATH = "/workspace/models/Qwen3-30B-A3B-Q4_K_M.gguf"
     MODEL_READY = "/tmp/sparkinfer_model_ready"
@@ -682,6 +680,11 @@ def main():
                         f"SPARKINFER_P35_GUARD_32K_PP_BASELINE={args.p35_guard_32k_pp_baseline} "
                         f"SPARKINFER_P35_GUARD_64K_PP_BASELINE={args.p35_guard_64k_pp_baseline} "
                         f"SPARKINFER_P35_GUARD_128K_PP_BASELINE={args.p35_guard_128k_pp_baseline} "
+                        f"SPARKINFER_P36_GUARD_128_PP_BASELINE={args.p36_guard_128_pp_baseline} "
+                        f"SPARKINFER_P36_GUARD_512_PP_BASELINE={args.p36_guard_512_pp_baseline} "
+                        f"SPARKINFER_P36_GUARD_4K_PP_BASELINE={args.p36_guard_4k_pp_baseline} "
+                        f"SPARKINFER_P36_GUARD_16K_PP_BASELINE={args.p36_guard_16k_pp_baseline} "
+                        f"SPARKINFER_P36_GUARD_32K_PP_BASELINE={args.p36_guard_32k_pp_baseline} "
                         f"SPARKINFER_P36_GUARD_128_BASELINE={args.p_guard_128_baseline} "
                         f"SPARKINFER_P36_GUARD_512_BASELINE={args.p_guard_512_baseline} "
                         f"SPARKINFER_P36_GUARD_4K_BASELINE={args.p_guard_4k_baseline} "
@@ -777,20 +780,21 @@ def main():
             print(f">> bare-metal box left running (ssh root@{host}:{port})")
         else:
             destroy = args.destroy or (args.destroy_on_error and not got_result and created)
-            if args.keep:
-                print(f">> leaving instance {iid} running (--keep)")
-            elif destroy:
-                print(f">> destroying instance {iid} (disk freed)")
-                try:
-                    v.destroy_instance(id=iid)
-                except Exception as e:
-                    print("destroy:", str(e)[:150])
+            if args.stop:
+                if destroy:
+                    print(f">> destroying instance {iid} (disk freed)")
+                    try:
+                        v.destroy_instance(id=iid)
+                    except Exception as e:
+                        print("destroy:", str(e)[:150])
+                else:
+                    print(f">> stopping instance {iid} — disk/weights persist; resume with --reuse {iid}")
+                    try:
+                        v.stop_instance(id=iid)
+                    except Exception as e:
+                        print("stop:", str(e)[:150])
             else:
-                print(f">> stopping instance {iid} — disk/weights persist; resume with --reuse {iid}")
-                try:
-                    v.stop_instance(id=iid)
-                except Exception as e:
-                    print("stop:", str(e)[:150])
+                print(f">> leaving instance {iid} running")
 
 if __name__ == "__main__":
     main()

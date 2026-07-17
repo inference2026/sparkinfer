@@ -43,13 +43,8 @@ def current_instance(default):
     except Exception: return default
 
 # Pinned default box: a stable, known-good instance (cached model, good download speed) that we
-# reuse first on every run and NEVER destroy. vast_eval.py is invoked with --pinned for it, so on
-# bring-up failure it retries on later scheduled runs instead of provisioning immediately;
-# only after VAST_REUSE_MAX_RETRIES misses does it spin up a new box (the pinned one is kept).
-# Set VAST_DEFAULT_INSTANCE="" to disable the pin and always provision fresh.
-# The pin id lives in a file so it can self-heal: when the pinned box is reclaimed and the eval
-# provisions a fresh one, we re-pin to that fresh box (write its id here). Seed/override via
-# VAST_DEFAULT_INSTANCE; set it to "" to disable pinning entirely (always provision fresh).
+# reuse on every run and NEVER destroy. On bring-up failure vast_eval exits PINNED_RETRY_RC for
+# the next scheduled run. Set VAST_DEFAULT_INSTANCE="" to disable the pin.
 PIN_FILE = os.path.expanduser(os.environ.get("VAST_PIN_FILE", "~/.sparkinfer_pinned_instance"))
 def _read_pin():
     try:
@@ -89,6 +84,11 @@ def _bidir_baseline_args(q36, q35):
         "--p-guard-4k-baseline",  str(q36["4k"]),
         "--p-guard-16k-baseline", str(q36["16k"]),
         "--p-guard-32k-baseline", str(q36["32k"]),
+        "--p36-guard-128-pp-baseline", str(q36.get("128_pp", 0)),
+        "--p36-guard-512-pp-baseline", str(q36.get("512_pp", 0)),
+        "--p36-guard-4k-pp-baseline", str(q36.get("4k_pp", 0)),
+        "--p36-guard-16k-pp-baseline", str(q36.get("16k_pp", 0)),
+        "--p36-guard-32k-pp-baseline", str(q36.get("32k_pp", 0)),
         "--g36-guard-128-baseline", str(q36["128"]),
         "--g36-guard-512-baseline", str(q36["512"]),
         "--g36-guard-4k-baseline",  str(q36["4k"]),
@@ -112,9 +112,14 @@ def _apply_bidir_ctx_from_bres(bres, q36, q35):
         "16k": "ctx_16384_tps", "32k": "ctx_32768_tps",
         "64k": "ctx_65536_tps", "128k": "ctx_131072_tps",
     }
-    pp_map = {
+    pp_map_q35 = {
         "4k_pp": "ctx_4096_pp_tps", "32k_pp": "ctx_32768_pp_tps",
         "64k_pp": "ctx_65536_pp_tps", "128k_pp": "ctx_131072_pp_tps",
+    }
+    pp_map_q36 = {
+        "128_pp": "ctx_128_pp_tps", "512_pp": "ctx_512_pp_tps",
+        "4k_pp": "ctx_4096_pp_tps", "16k_pp": "ctx_16384_pp_tps",
+        "32k_pp": "ctx_32768_pp_tps",
     }
 
     def _fill(score, store, keys):
@@ -127,11 +132,11 @@ def _apply_bidir_ctx_from_bres(bres, q36, q35):
             store[k] = v
         return True
 
-    def _fill_pp(score, store, keys):
+    def _fill_pp(score, store, keys, mapping):
         if not score:
             return False
         for k in keys:
-            v = float(score.get(pp_map[k]) or 0)
+            v = float(score.get(mapping[k]) or 0)
             if v <= 0:
                 return False
             store[k] = v
@@ -139,7 +144,8 @@ def _apply_bidir_ctx_from_bres(bres, q36, q35):
 
     got36 = _fill(bres.get("score_qwen36"), q36, ("128", "512", "4k", "16k", "32k"))
     got35 = _fill(bres.get("score_qwen35"), q35, ("128", "4k", "32k", "64k"))
-    _fill_pp(bres.get("score_qwen35"), q35, ("4k_pp", "32k_pp", "64k_pp"))
+    _fill_pp(bres.get("score_qwen36"), q36, ("128_pp", "512_pp", "4k_pp", "16k_pp", "32k_pp"), pp_map_q36)
+    _fill_pp(bres.get("score_qwen35"), q35, ("4k_pp", "32k_pp", "64k_pp", "128k_pp"), pp_map_q35)
     return got36 and got35
 
 
@@ -249,7 +255,8 @@ CONTEXT_LABELS     = {"128-context", "512-context", "4k-context", "16k-context",
                       "64k-context", "128k-context"}
 REGRESSION_LABELS  = {"regression-128", "regression-512", "regression-4k", "regression-16k",
                       "regression-32k", "regression-64k", "regression-128k",
-                      "regression-4k-pp", "regression-32k-pp", "regression-64k-pp", "regression-128k-pp"}
+                      "regression-128-pp", "regression-512-pp", "regression-4k-pp",
+                      "regression-16k-pp", "regression-32k-pp", "regression-64k-pp", "regression-128k-pp"}
 
 # Per-context guard baseline fallbacks for display when the RESULT_JSON baseline is 0.
 # Mirrors evaluate_dual.sh hardcoded defaults (used when both eval-box measurement and
@@ -951,17 +958,49 @@ def apply_regression_labels(repo, num, cur, labels):
     for lab in want - cur:
         add_label(repo, num, lab)
 
-_PREFILL_CTX_METRICS = (
+_PREFILL_CTX_METRICS_Q35 = (
     ("ctx_4096_pp_tps", 4096, "4k-context"),
     ("ctx_32768_pp_tps", 32768, "32k-context"),
     ("ctx_65536_pp_tps", 65536, "64k-context"),
     ("ctx_131072_pp_tps", 131072, "128k-context"),
 )
+_PREFILL_CTX_METRICS_Q36 = (
+    ("ctx_128_pp_tps", 128, "128-context"),
+    ("ctx_512_pp_tps", 512, "512-context"),
+    ("ctx_4096_pp_tps", 4096, "4k-context"),
+    ("ctx_16384_pp_tps", 16384, "16k-context"),
+    ("ctx_32768_pp_tps", 32768, "32k-context"),
+)
+_PREFILL_PP_GATES_Q35 = (
+    ("ctx_4096_pp_tps", "guard_4k_pp_pass", "guard_4k_pp_baseline", "4k prefill"),
+    ("ctx_32768_pp_tps", "guard_32k_pp_pass", "guard_32k_pp_baseline", "32k prefill"),
+    ("ctx_65536_pp_tps", "guard_64k_pp_pass", "guard_64k_pp_baseline", "64k prefill"),
+    ("ctx_131072_pp_tps", "guard_128k_pp_pass", "guard_128k_pp_baseline", "128k prefill"),
+)
+_PREFILL_PP_GATES_Q36 = (
+    ("ctx_128_pp_tps", "guard_128_pp_pass", "guard_128_pp_baseline", "128 prefill"),
+    ("ctx_512_pp_tps", "guard_512_pp_pass", "guard_512_pp_baseline", "512 prefill"),
+    ("ctx_4096_pp_tps", "guard_4k_pp_pass", "guard_4k_pp_baseline", "4k prefill"),
+    ("ctx_16384_pp_tps", "guard_16k_pp_pass", "guard_16k_pp_baseline", "16k prefill"),
+    ("ctx_32768_pp_tps", "guard_32k_pp_pass", "guard_32k_pp_baseline", "32k prefill"),
+)
+
+def _prefill_metrics_for_block(block):
+    profile = block.get("prefill_profile")
+    if profile == "qwen36" or block.get("ctx_128_pp_tps"):
+        return _PREFILL_CTX_METRICS_Q36
+    return _PREFILL_CTX_METRICS_Q35
+
+def _prefill_gates_for_block(block):
+    profile = block.get("prefill_profile")
+    if profile == "qwen36" or block.get("ctx_128_pp_tps"):
+        return _PREFILL_PP_GATES_Q36
+    return _PREFILL_PP_GATES_Q35
 
 def _best_prefill_measurement(block):
     """Return (tps, ctx, label) for the highest measured prefill context, if any."""
     best = None
-    for key, ctx, lbl in _PREFILL_CTX_METRICS:
+    for key, ctx, lbl in _prefill_metrics_for_block(block):
         tps = float(block.get(key) or 0)
         if tps > 0 and (best is None or tps > best[0]):
             best = (tps, ctx, lbl)
@@ -1048,11 +1087,7 @@ def render(res, oid):
                 rows.append(f"| {title} {lbl} no-regression gate | {tps} tok/s"
                             f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
             if block.get("eval_prefill"):
-                for key, gkey, bkey, lbl in [
-                        ("ctx_4096_pp_tps", "guard_4k_pp_pass", "guard_4k_pp_baseline", "4k prefill"),
-                        ("ctx_32768_pp_tps", "guard_32k_pp_pass", "guard_32k_pp_baseline", "32k prefill"),
-                        ("ctx_65536_pp_tps", "guard_64k_pp_pass", "guard_64k_pp_baseline", "64k prefill"),
-                        ("ctx_131072_pp_tps", "guard_128k_pp_pass", "guard_128k_pp_baseline", "128k prefill")]:
+                for key, gkey, bkey, lbl in _prefill_gates_for_block(block):
                     if key not in block and bkey not in block:
                         continue
                     tps = block.get(key, 0)
@@ -1161,7 +1196,10 @@ def render(res, oid):
         note = "No context cleared the 2% significance gate while at least one context regressed. Auto-closing this PR."
     if res.get("infra_error") or str(res.get("reason") or "").startswith("infra error"):
         note = "Infra failure during eval (not a verified PR regression) — re-run recommended."
-    target_note = ("128/512/4k/16k/32k guarded · Qwen3.5 prefill at 4k/32k/64k · scored vs same-box main"
+    target_note = ("128/512/4k/16k/32k guarded · Qwen3.5 prefill at 4k/32k/64k/128k · "
+                   "Qwen3.6 prefill at 128/512/4k/16k/32k · scored vs same-box main"
+                   if res.get("eval_mode") == "longctx" and res.get("mode") == "bidir"
+                   else "128/512/4k/16k/32k guarded · Qwen3.5 prefill at 4k/32k/64k/128k · scored vs same-box main"
                    if res.get("eval_mode") == "longctx" and (res.get("score_qwen35") or {}).get("eval_prefill")
                    else "128/512/4k/16k/32k guarded · scored vs same-box main · strongest context scores"
                    if res.get("eval_mode") == "longctx" else "128-token decode scored vs same-box main")
@@ -1195,11 +1233,20 @@ Q35_CTX_SERIES = {
     65536:  {"label": "64k",  "ref_tps": 220.54},
 }
 # Qwen3.5 prefill pp anchors — pinned in bench/scripts/reference.lock (RTX 5090).
-Q35_PP_ORDER = ("4k", "32k", "64k")
+Q35_PP_ORDER = ("4k", "32k", "64k", "128k")
 Q35_PP_SERIES = {
-    4096:   {"label": "4k",   "metric": "ctx_4096_pp_tps",  "ref_pp": 11104.62, "color": "#0E8A16"},
-    32768:  {"label": "32k",  "metric": "ctx_32768_pp_tps", "ref_pp": 9772.31,  "color": "#6F42C1"},
-    65536:  {"label": "64k",  "metric": "ctx_65536_pp_tps", "ref_pp": 8153.53,  "color": "#E67E22"},
+    4096:   {"label": "4k",   "metric": "ctx_4096_pp_tps",   "ref_pp": 11104.62, "color": "#0E8A16"},
+    32768:  {"label": "32k",  "metric": "ctx_32768_pp_tps",  "ref_pp": 9772.31,  "color": "#6F42C1"},
+    65536:  {"label": "64k",  "metric": "ctx_65536_pp_tps",  "ref_pp": 8153.53,  "color": "#E67E22"},
+    131072: {"label": "128k", "metric": "ctx_131072_pp_tps", "ref_pp": 5999.59,  "color": "#17A2B8"},
+}
+Q36_PP_ORDER = ("128", "512", "4k", "16k", "32k")
+Q36_PP_SERIES = {
+    128:    {"label": "128",  "metric": "ctx_128_pp_tps",    "ref_pp": 0, "color": "#D14D72"},
+    512:    {"label": "512",  "metric": "ctx_512_pp_tps",    "ref_pp": 0, "color": "#7B5DFF"},
+    4096:   {"label": "4k",   "metric": "ctx_4096_pp_tps",   "ref_pp": 0, "color": "#0E8A16"},
+    16384:  {"label": "16k",  "metric": "ctx_16384_pp_tps",  "ref_pp": 0, "color": "#B8860B"},
+    32768:  {"label": "32k",  "metric": "ctx_32768_pp_tps",  "ref_pp": 0, "color": "#6F42C1"},
 }
 Q36_CTX_ORDER = ("128", "512", "4k", "16k", "32k")
 # Qwen3.6-35B-A3B llama.cpp decode refs (RTX 5090) — pinned in bench/scripts/reference.lock
@@ -1627,6 +1674,49 @@ def _upsert_qwen35_pp(data, sub):
         q35["prefill_label"] = sub["prefill_label"]
     return changed
 
+def _upsert_qwen36_pp(data, sub):
+    """Refresh Qwen3.6 per-context prefill pp bars from a merged bidir score_qwen36 block."""
+    q36 = data.setdefault("qwen36", {})
+    pp_rows = {r.get("label"): r for r in q36.get("pp") or []}
+    changed = False
+    for ctx, meta in Q36_PP_SERIES.items():
+        measured = sub.get(meta["metric"])
+        if measured is None:
+            continue
+        new = round(float(measured), 2)
+        old = round(float((pp_rows.get(meta["label"]) or {}).get("pp") or 0), 2)
+        if old and new < old:
+            continue
+        row = pp_rows.get(meta["label"])
+        if row:
+            if old != new:
+                row["pp"] = new
+                row["color"] = meta["color"]
+                changed = True
+        else:
+            pp_rows[meta["label"]] = {
+                "label": meta["label"], "color": meta["color"],
+                "pp": new, "ref_pp": meta["ref_pp"],
+            }
+            changed = True
+    if changed:
+        q36["pp"] = [pp_rows[k] for k in Q36_PP_ORDER if k in pp_rows]
+    scored = sub.get("prefill_tps")
+    if scored is not None:
+        old_f = round(float(q36.get("prefill_frontier_pp") or 0), 2)
+        new_f = round(max(old_f, float(scored)), 2)
+        if new_f != old_f:
+            q36["prefill_frontier_pp"] = new_f
+            changed = True
+    elif changed and q36.get("pp"):
+        peak = max(float(r.get("pp") or 0) for r in q36["pp"])
+        old_f = round(float(q36.get("prefill_frontier_pp") or 0), 2)
+        if peak > old_f:
+            q36["prefill_frontier_pp"] = round(peak, 2)
+    if sub.get("prefill_label"):
+        q36["prefill_label"] = sub["prefill_label"]
+    return changed
+
 def _upsert_qwen36_ctx(data, sub):
     """Refresh Qwen3.6 per-context sparkinfer bars from a merged bidir score_qwen36 block.
 
@@ -1816,6 +1906,8 @@ def record_merge(repo, num):
             if sub.get("top1") is not None: q36["token_match"] = round(sub["top1"], 4)
             if sub.get("kl") is not None:   q36["kl"] = round(sub["kl"], 4)
             _upsert_qwen36_ctx(data, sub)
+            if sub.get("eval_prefill"):
+                _upsert_qwen36_pp(data, sub)
             short = re.sub(r"^\w+(\([^)]*\))?:\s*", "", e.get("title", ""))[:28]
             landed = [m for m in data.get("landed_qwen36", []) if m.get("pr") != num and not m.get("baseline")]
             landed.append({"name": short or f"PR #{num}", "tps": step, "pr": num,
@@ -2102,6 +2194,11 @@ def main():
         "4k":  float(os.environ.get("SPARKINFER_QWEN36_4K",  "287.91")),
         "16k": float(os.environ.get("SPARKINFER_QWEN36_16K", "338.55")),
         "32k": float(os.environ.get("SPARKINFER_QWEN36_32K", "301.19")),
+        "128_pp": float(os.environ.get("SPARKINFER_QWEN36_128_PP", "0")),
+        "512_pp": float(os.environ.get("SPARKINFER_QWEN36_512_PP", "0")),
+        "4k_pp": float(os.environ.get("SPARKINFER_QWEN36_4K_PP", "0")),
+        "16k_pp": float(os.environ.get("SPARKINFER_QWEN36_16K_PP", "0")),
+        "32k_pp": float(os.environ.get("SPARKINFER_QWEN36_32K_PP", "0")),
         "llama128": float(os.environ.get("SPARKINFER_QWEN36_LLAMA_128", "275.81")),
         "llama512": float(os.environ.get("SPARKINFER_QWEN36_LLAMA_512", "275.61")),
         "llama4k":  float(os.environ.get("SPARKINFER_QWEN36_LLAMA_4K",  "276.30")),
@@ -2376,7 +2473,7 @@ def main():
         bcmd = [sys.executable, os.path.join(HERE, "vast_eval.py"),
                 *_vast_eval_transport_args(args.instance),
                 "--ref", "origin/main", "--frontier", "0", "--ceiling", str(args.ceiling),
-                "--eval-mode", "longctx", "--keep"]
+                "--eval-mode", "longctx"]
         if args.bidir:
             bcmd += ["--bidir", "--primary-quant", args.primary_quant, "--baseline-only"]
         if PINNED_INSTANCE and not ssh_box_enabled() and str(base_iid) == PINNED_INSTANCE:
@@ -2392,8 +2489,7 @@ def main():
                 try:
                     nid = int(l.split()[1])
                     with open(INSTANCE_FILE, "w") as f: f.write(str(nid))
-                    if PINNED_INSTANCE: _write_pin(nid)
-                    print(f"  (instance updated to {nid}{'; re-pinned' if PINNED_INSTANCE else ''})")
+                    print(f"  (instance updated to {nid})")
                 except Exception: pass
         bline = next((l for l in br.stdout.splitlines() if l.startswith("RESULT_JSON")), None)
         bres = json.loads(bline[len("RESULT_JSON "):]) if bline else {}
@@ -2453,16 +2549,19 @@ def main():
     if args.bidir:
         print(f"  Qwen3.6 same-box main: 128={QWEN36_BASE['128']} 512={QWEN36_BASE['512']} "
               f"4k={QWEN36_BASE['4k']} 16k={QWEN36_BASE['16k']} 32k={QWEN36_BASE['32k']} tok/s")
+        if any(QWEN36_BASE.get(k, 0) for k in ("128_pp", "512_pp", "4k_pp", "16k_pp", "32k_pp")):
+            print(f"  Qwen3.6 prefill pp: 128={QWEN36_BASE.get('128_pp', 0)} "
+                  f"512={QWEN36_BASE.get('512_pp', 0)} 4k={QWEN36_BASE.get('4k_pp', 0)} "
+                  f"16k={QWEN36_BASE.get('16k_pp', 0)} 32k={QWEN36_BASE.get('32k_pp', 0)} pp tok/s")
         print(f"  Qwythos ({args.primary_quant}) same-box main: "
               f"128={QWYTHOS_BASE['128']} 4k={QWYTHOS_BASE['4k']} "
               f"32k={QWYTHOS_BASE['32k']} 64k={QWYTHOS_BASE['64k']} tok/s")
-        if any(QWYTHOS_BASE.get(k, 0) for k in ("4k_pp", "32k_pp", "64k_pp")):
+        if any(QWYTHOS_BASE.get(k, 0) for k in ("4k_pp", "32k_pp", "64k_pp", "128k_pp")):
             print(f"  Qwythos prefill pp: 4k={QWYTHOS_BASE.get('4k_pp', 0)} "
-                  f"32k={QWYTHOS_BASE.get('32k_pp', 0)} 64k={QWYTHOS_BASE.get('64k_pp', 0)} pp tok/s")
+                  f"32k={QWYTHOS_BASE.get('32k_pp', 0)} 64k={QWYTHOS_BASE.get('64k_pp', 0)} "
+                  f"128k={QWYTHOS_BASE.get('128k_pp', 0)} pp tok/s")
 
-    # Run all pending evals on the SAME instance: pass --keep so vast_eval.py never stops/destroys
-    # the box mid-queue. The bot stops the instance once after ALL PRs finish (or if the instance
-    # dies, subsequent PRs self-heal by provisioning a new one).
+    # Run all pending evals on the same vast instance (left running between PRs and after the run).
     for i, (pr, num, branch, oid, ref, areas) in enumerate(pending):
         # Grade against the same-box baseline = MERGED origin/main (measured above). Every PR in the
         # run is graded against main, NOT against other PRs in the run — #67 and #70 are independent
@@ -2480,17 +2579,13 @@ def main():
                "--guard-512-baseline", str(run_guard_512),
                "--guard-4k-baseline", str(run_guard_4k),
                "--guard-16k-baseline", str(run_guard_16k),
-               "--guard-32k-baseline", str(run_guard_32k),
-               "--keep"]
+               "--guard-32k-baseline", str(run_guard_32k)]
         if args.bidir:
-            cmd[cmd.index("--keep"):cmd.index("--keep")] = [
-                "--bidir",
-                "--primary-quant", args.primary_quant,
-            ] + _bidir_baseline_args(QWEN36_BASE, QWYTHOS_BASE)
+            cmd += ["--bidir", "--primary-quant", args.primary_quant] + _bidir_baseline_args(QWEN36_BASE, QWYTHOS_BASE)
         if PINNED_INSTANCE and not ssh_box_enabled() and str(cur_iid) == PINNED_INSTANCE:
-            cmd.append("--pinned")  # never destroy the pin; retry-then-fallback on bring-up failure
+            cmd.append("--pinned")
         if args.polaris:
-            cmd.insert(cmd.index("--keep"), "--polaris")
+            cmd.append("--polaris")
         pinned = "--pinned" in cmd
         box_label = ssh_box_arg() if ssh_box_enabled() else f"instance {cur_iid}"
         print(f"PR #{num} @ {oid}: evaluating '{ref}' (vs same-box main) on {box_label}"
@@ -2500,14 +2595,13 @@ def main():
             tail = next((l for l in reversed((r.stdout + r.stderr).splitlines()) if l.strip()), "")
             print(f">> {tail}\n>> aborting this run — the next scheduled run retries the "
                   f"pinned box. No PRs evaluated this tick."); return
-        # If vast_eval self-healed/fell back to a new instance, track the new id for the next PR.
+        # Legacy: --allow-provision may emit NEW_INSTANCE_ID (auto-rent is off by default).
         for l in r.stdout.splitlines():
             if l.startswith("NEW_INSTANCE_ID "):
                 try:
                     new_id = int(l.split()[1])
                     with open(INSTANCE_FILE, "w") as f: f.write(str(new_id))
-                    if PINNED_INSTANCE: _write_pin(new_id)   # self-heal: re-pin to the fresh box
-                    print(f"  (instance updated to {new_id}{'; re-pinned' if PINNED_INSTANCE else ''})")
+                    print(f"  (instance updated to {new_id})")
                 except Exception: pass
         line = next((l for l in r.stdout.splitlines() if l.startswith("RESULT_JSON")), None)
         if not line:
@@ -2585,12 +2679,6 @@ def main():
     if not args.dry_run:
         reconcile_merge_labels(args.repo)
 
-    # Stop vast instance after all PRs (bare-metal SSH boxes are left running).
-    if not ssh_box_enabled():
-        final_iid = current_instance(args.instance)
-        if final_iid:
-            print(f">> stopping instance {final_iid} — model cache persists for next run")
-            subprocess.run(["vastai", "stop", "instance", str(final_iid)], capture_output=True)
     print("done — no merges (manual).")
 
 if __name__ == "__main__":
