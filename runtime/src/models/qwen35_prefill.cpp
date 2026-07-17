@@ -17,6 +17,9 @@
 #include "sparkinfer/kernels/quant.h"
 #include "sparkinfer/kernels/gemm.h"
 #include "sparkinfer/kernels/prefill_i8.h"
+#include "sparkinfer/kernels/moe_prefill.h"
+#include "sparkinfer/kernels/moe.h"
+#include "sparkinfer/kernels/quant.h"
 
 #include <cuda_runtime.h>
 #include <cmath>
@@ -48,9 +51,14 @@ struct Arena {
 
 int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n) {
     const Qwen35Config& c = s.cfg;
-    // Only the Qwen3.5 dense-hybrid path is supported (GGUF-native, quantized weights).
-    if (!s.gguf || !c.hybrid || !c.dense_ffn || n <= 0) return -1;
+    // Batched prefill supports the Qwen3.5 dense-hybrid (Qwythos) AND the Qwen3.6-35B-A3B MoE hybrid.
+    // Both share the GDN + full-attention batched kernels (identical math at 128/16/32 GDN dims and
+    // 256/64 attn dims); they differ ONLY in the FFN, branched below (dense SwiGLU vs grouped MoE).
+    const bool moe = !c.dense_ffn && c.n_experts > 0;
+    if (!s.gguf || !c.hybrid || n <= 0) return -1;
+    if (!c.dense_ffn && !moe) return -1;
     if (c.head_dim != 256 || c.linear_head_dim != 128) return -1;   // kernels specialize these
+    if (moe && c.n_experts != 256) return -1;                       // router top-k path specialized for 256
 
     const int H = c.hidden;
     const int N = n;
@@ -60,12 +68,22 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     const int lqkv = s.linear_qkvdim;                    // 8192
     const int lvdim = s.linear_vdim;                     // 4096
     const int vh   = c.linear_v_heads;                   // 32
-    const int ffn  = c.moe_ffn;                          // 12288
+    const int ffn  = c.moe_ffn;                          // dense: 12288; MoE: per-expert 512
     const int wide = 2 * qdim;                           // 8192 (qraw); also >= lqkv
-    const size_t maxw = (size_t)ffn * H;                 // largest weight (gate/up/down)
-    // The dense FFN is processed in token-chunks so its ffn-wide scratch (ffg/ffu/A_i8) stays O(chunk)
+    // wbuf must hold the largest weight the `dq` lambda dequantizes: the dense FFN (ffn*H) OR, on the
+    // MoE path (small ffn=512), the biggest projection (wide/lqkv * H). Cover all of them.
+    size_t maxw = (size_t)wide * H;
+    if ((size_t)lqkv * H > maxw) maxw = (size_t)lqkv * H;
+    if (!moe && (size_t)ffn * H > maxw) maxw = (size_t)ffn * H;
+    // int8 proj scratch dims: largest projection input K (A rows) and output n_out (channel scales).
+    // On MoE the small per-expert ffn (512) is NOT the max, so size against the real projections.
+    auto imax = [](int x, int y) { return x > y ? x : y; };
+    const int maxAK = moe ? imax(qdim, lvdim) : imax(ffn, imax(qdim, lvdim));   // max proj input dim
+    const int maxNO = moe ? imax(wide, lqkv) : imax(ffn, imax(wide, lqkv));     // max proj output dim
+    // Dense FFN is processed in token-chunks so its ffn-wide scratch (ffg/ffu/A_i8) stays O(chunk)
     // instead of O(N) — at long context those full-width buffers dominate and OOM (~8 GB @128k). The
     // FFN is per-token independent, so chunking is numerically identical. Env override; default 32768.
+    // (MoE doesn't use ffg/ffu — its grouped FFN has its own O(N*top_k) scratch, so chunking is moot.)
     const int ffn_chunk = []{ const char* e = getenv("SPARKINFER_PREFILL_FFN_CHUNK"); int c = e ? atoi(e) : 32768; return c > 0 ? c : 32768; }();
     const int FC = (N < ffn_chunk) ? N : ffn_chunk;
     bf16* lin_conv_state = static_cast<bf16*>(s.lin_conv_state);
@@ -114,14 +132,46 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
     static int bf16_minctx = []{ const char* e = getenv("SPARKINFER_PREFILL_BF16_MINCTX"); return e ? atoi(e) : 98304; }();
     if (N > bf16_minctx) use_i8 = false;
     Arena a8;
-    // A_i8 holds the quantized activation: non-FFN projs quantize N rows x K(<=H); the chunked FFN
-    // quantizes at most FC rows x ffn. Size to the max of the two (N*H dominates at the default chunk).
-    const size_t a_i8_sz = ((size_t)N * H > (size_t)FC * ffn) ? (size_t)N * H : (size_t)FC * ffn;
+    // A_i8 holds the quantized activation. Dense: non-FFN projs quantize N rows x K(<=H); the chunked
+    // FFN quantizes at most FC rows x ffn -> max of the two. MoE: no chunked FFN; the projections
+    // (attn Q/K/V/O, GDN, shared) quantize N rows x maxAK (=max input dim, 4096 for Qwen3.6).
+    const size_t a_i8_sz = moe ? (size_t)N * maxAK
+                               : (((size_t)N * H > (size_t)FC * ffn) ? (size_t)N * H : (size_t)FC * ffn);
     signed char* A_i8 = use_i8 ? a8.alloc<signed char>(a_i8_sz) : nullptr;
     signed char* W_i8 = use_i8 ? a8.alloc<signed char>(maxw) : nullptr;
     float* sx = use_i8 ? a8.alloc<float>((size_t)N) : nullptr;
-    float* sw = use_i8 ? a8.alloc<float>((size_t)ffn) : nullptr;
+    float* sw = use_i8 ? a8.alloc<float>((size_t)maxNO) : nullptr;
     if (use_i8 && !a8.ok) { a8.free_all(); use_i8 = false; }
+
+    // ---- MoE (Qwen3.6) scratch: grouped expert FFN + shared expert ----
+    const int E = moe ? c.n_experts : 0, tk = moe ? c.top_k : 0, mffn = moe ? c.moe_ffn : 0;
+    const size_t P = (size_t)N * (tk > 0 ? tk : 1);
+    bf16*  gate_bf = moe ? a.alloc<bf16>((size_t)E * mffn * H) : nullptr;   // dequant'd experts (once/layer)
+    bf16*  up_bf   = moe ? a.alloc<bf16>((size_t)E * mffn * H) : nullptr;
+    bf16*  down_bf = moe ? a.alloc<bf16>((size_t)E * H * mffn) : nullptr;
+    float* rlog    = moe ? a.alloc<float>((size_t)N * (E ? E : 1)) : nullptr;
+    int*   mf_ids  = moe ? a.alloc<int>(P) : nullptr;
+    float* mf_wts  = moe ? a.alloc<float>(P) : nullptr;
+    int*   mcounts = moe ? a.alloc<int>(E ? E : 1) : nullptr;
+    int*   moff    = moe ? a.alloc<int>((E ? E : 1) + 1) : nullptr;
+    int*   psrc    = moe ? a.alloc<int>(P) : nullptr;
+    float* pw      = moe ? a.alloc<float>(P) : nullptr;
+    bf16*  xperm   = moe ? a.alloc<bf16>(P * H) : nullptr;
+    bf16*  gperm   = moe ? a.alloc<bf16>(P * (mffn ? mffn : 1)) : nullptr;
+    bf16*  uperm   = moe ? a.alloc<bf16>(P * (mffn ? mffn : 1)) : nullptr;
+    bf16*  hperm   = moe ? a.alloc<bf16>(P * (mffn ? mffn : 1)) : nullptr;
+    bf16*  yperm   = moe ? a.alloc<bf16>(P * H) : nullptr;
+    float* routf   = moe ? a.alloc<float>((size_t)N * H) : nullptr;
+    bf16*  shg     = moe ? a.alloc<bf16>((size_t)N * (mffn ? mffn : 1)) : nullptr;
+    bf16*  shu     = moe ? a.alloc<bf16>((size_t)N * (mffn ? mffn : 1)) : nullptr;
+    bf16*  shh     = moe ? a.alloc<bf16>((size_t)N * (mffn ? mffn : 1)) : nullptr;
+    bf16*  shout   = moe ? a.alloc<bf16>((size_t)N * H) : nullptr;
+    float* dsw     = moe ? a.alloc<float>((size_t)N) : nullptr;
+    const int moe_maxT = moe ? kernels::moe_prefill_grouped_maxtiles((int)P, E) : 0;
+    int* sched_te = moe ? a.alloc<int>(moe_maxT) : nullptr;   // grouped-GEMM tile schedule (reused/layer)
+    int* sched_tr = moe ? a.alloc<int>(moe_maxT) : nullptr;
+    int* sched_dT = moe ? a.alloc<int>(1) : nullptr;
+    if (moe && !a.ok) { a.free_all(); a8.free_all(); fprintf(stderr, "[prefill] MoE scratch alloc failed (ctx=%d) -> fallback\n", N); return -1; }
 
     pf_cu(cudaMemcpyAsync(d_ids, prompt_ids, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "prefill ids");
 
@@ -204,15 +254,57 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
         kernels::launch_rmsnorm(x, w.post_attn_norm, hn, N, H, eps, st);
 
-        // dense SwiGLU FFN, chunked over tokens: ffg/ffu/A_i8 stay O(FC*ffn). Per-token independent,
-        // so this is numerically identical to the full-width pass; only the ffn-wide scratch shrinks.
-        for (int fo = 0; fo < N; fo += FC) {
-            const int fn = (N - fo < FC) ? (N - fo) : FC;
-            const bf16* hn_c = hn + (size_t)fo * H;
-            proj(hn_c, w.gate_q, w.gate_qtype, ffg, ffn, H, fn);
-            proj(hn_c, w.up_q,   w.up_qtype,   ffu, ffn, H, fn);
-            kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
-            proj(ffg, w.down_q, w.down_qtype, ao + (size_t)fo * H, H, ffn, fn);
+        if (!moe) {
+            // dense SwiGLU FFN, chunked over tokens: ffg/ffu/A_i8 stay O(FC*ffn). Per-token
+            // independent, so this is numerically identical to the full-width pass.
+            for (int fo = 0; fo < N; fo += FC) {
+                const int fn = (N - fo < FC) ? (N - fo) : FC;
+                const bf16* hn_c = hn + (size_t)fo * H;
+                proj(hn_c, w.gate_q, w.gate_qtype, ffg, ffn, H, fn);
+                proj(hn_c, w.up_q,   w.up_qtype,   ffu, ffn, H, fn);
+                kernels::launch_prefill_swiglu(ffg, ffu, ffg, (long)fn * ffn, st);
+                proj(ffg, w.down_q, w.down_qtype, ao + (size_t)fo * H, H, ffn, fn);
+            }
+        } else {
+            // ---- grouped MoE FFN: weight-amortized over the N prompt tokens ----
+            // router (fp32 logits, matching the per-token float router) -> top-8 + softmax + histogram
+            kernels::launch_moe_prefill_router_logits(hn, dq(w.router_w, w.router_w_type, E, H), rlog, N, E, H, st);
+            kernels::launch_moe_router(rlog, mf_ids, mf_wts, mcounts, N, E, tk, 1, st);
+            // dequant all E experts once (Q4_K rows are independent -> one launch per tensor)
+            kernels::launch_gguf_dequant(w.gate_qtype, w.gate_q, gate_bf, (long)E * mffn * H, st);
+            kernels::launch_gguf_dequant(w.up_qtype,   w.up_q,   up_bf,   (long)E * mffn * H, st);
+            kernels::launch_gguf_dequant(w.down_qtype, w.down_q, down_bf, (long)E * H * mffn, st);
+            // permute tokens into per-expert groups; grouped GEMMs; swiglu; weighted scatter-add
+            kernels::launch_moe_prefill_permute(mf_ids, mf_wts, mcounts, moff, psrc, pw, N, E, tk, st);
+            const int Pn = N * tk;
+            kernels::launch_moe_prefill_build_sched(moff, sched_te, sched_tr, sched_dT, E, st);
+            kernels::launch_moe_prefill_gather(hn, psrc, xperm, Pn, H, st);
+            kernels::launch_moe_prefill_grouped_gemm(xperm, gate_bf, moff, sched_te, sched_tr, sched_dT, gperm, Pn, E, mffn, H, st);
+            kernels::launch_moe_prefill_grouped_gemm(xperm, up_bf,   moff, sched_te, sched_tr, sched_dT, uperm, Pn, E, mffn, H, st);
+            kernels::launch_moe_prefill_swiglu(gperm, uperm, hperm, (long)Pn * mffn, st);
+            kernels::launch_moe_prefill_grouped_gemm(hperm, down_bf, moff, sched_te, sched_tr, sched_dT, yperm, Pn, E, H, mffn, st);
+            pf_cu(cudaMemsetAsync(routf, 0, (size_t)N * H * sizeof(float), st), "moe routed zero");
+            kernels::launch_moe_prefill_scatter_weighted(yperm, psrc, pw, routf, Pn, H, st);
+            // shared expert (dense, applied to every token) + optional scalar sigmoid gate
+            const bf16* shared_ptr = nullptr; const float* dsw_ptr = nullptr;
+            const void* sg = w.shared_gate_q ? w.shared_gate_q : w.shared_gate;
+            if (c.n_shared > 0 && sg) {
+                const void* su = w.shared_up_q   ? w.shared_up_q   : w.shared_up;
+                const void* sd = w.shared_down_q ? w.shared_down_q : w.shared_down;
+                const int sgt = w.shared_gate_q ? w.shared_gate_qtype : 0;
+                const int sut = w.shared_up_q   ? w.shared_up_qtype   : 0;
+                const int sdt = w.shared_down_q ? w.shared_down_qtype : 0;
+                proj(hn, sg, sgt, shg, mffn, H);
+                proj(hn, su, sut, shu, mffn, H);
+                kernels::launch_prefill_swiglu(shg, shu, shh, (long)N * mffn, st);
+                proj(shh, sd, sdt, shout, H, mffn);
+                shared_ptr = shout;
+                if (w.shared_gate_inp) {
+                    kernels::launch_moe_shared_gate(hn, dq(w.shared_gate_inp, w.shared_gate_inp_type, 1, H), dsw, N, H, st);
+                    dsw_ptr = dsw;
+                }
+            }
+            kernels::launch_moe_prefill_finalize(routf, shared_ptr, dsw_ptr, ao, N, H, st);
         }
 
         // x += ffn_out (in-place residual) ; xn = RMSNorm(x, next_input_norm)  (final_norm on last layer)

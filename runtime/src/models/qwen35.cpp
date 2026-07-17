@@ -1106,8 +1106,9 @@ bool prefill_samples_lmhead() {
     return legacy != 0;
 }
 
-// Qwythos dense-hybrid batched prefill (prefill_batched_run). Default ON; SPARKINFER_PREFILL_BATCHED=0
-// disables. Batched fill runs from position 0 only; suffix-only reuse uses the token loop.
+// Batched prefill (prefill_batched_run). Default ON; SPARKINFER_PREFILL_BATCHED=0 disables. Supports
+// the Qwythos dense-hybrid AND the Qwen3.6-35B-A3B MoE hybrid (dense_ffn=false, n_experts>0) — both
+// share the GDN + attention batched kernels; only the FFN differs. From position 0 only.
 bool batched_prefill_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens) {
     static int want_batched = -1, batched_maxctx = -1;
     if (want_batched < 0) {
@@ -1119,7 +1120,8 @@ bool batched_prefill_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens) {
         const char* mc = getenv("SPARKINFER_PREFILL_BATCHED_MAXCTX");
         batched_maxctx = mc ? atoi(mc) : 131072;
     }
-    return want_batched && gguf && cfg.hybrid && cfg.dense_ffn && n_tokens > 0 &&
+    const bool ffn_ok = cfg.dense_ffn || cfg.n_experts > 0;
+    return want_batched && gguf && cfg.hybrid && ffn_ok && n_tokens > 0 &&
            n_tokens <= batched_maxctx;
 }
 } // namespace
