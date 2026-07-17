@@ -1,7 +1,7 @@
 """Eval box transport — vast.ai (default) or a fixed SSH box.
 
 Set EVAL_TRANSPORT=ssh to use a pinned bare-metal GPU (EVAL_SSH_HOST / EVAL_SSH_PORT).
-Leave unset or EVAL_TRANSPORT=vast to keep the existing vast.ai rent/reuse/stop logic.
+Leave unset or EVAL_TRANSPORT=vast to reuse a pinned vast.ai instance (no auto-rent/stop).
 
 Legacy alias: EVAL_USE_VAST=0 also selects the SSH box (requires EVAL_SSH_HOST).
 """

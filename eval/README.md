@@ -8,7 +8,7 @@ eval-loop **label** — automatically.
 
 | `EVAL_TRANSPORT` | Behavior |
 |------------------|----------|
-| `vast` (default) | Full vast.ai rent / reuse / stop logic — unchanged |
+| `vast` (default) | Reuse a pinned `--reuse` instance; left running after eval (no auto-rent) |
 | `ssh` | Fixed box via `EVAL_SSH_HOST` + `EVAL_SSH_PORT`; vast.ai is not contacted |
 
 Copy `.env.eval.example` → `.env.eval` for local/cron config. Legacy: `EVAL_USE_VAST=0` also
@@ -43,16 +43,17 @@ vastai create ssh-key "$(cat ~/.ssh/id_ed25519.pub)"
 ## Run
 
 ```bash
-# reuse a box (started if stopped) — evaluate, then STOP it again (the default):
+# reuse a box (started if stopped) — evaluate, left running after (default):
 python eval/vast_eval.py --reuse <instance_id> --frontier 164 --ceiling 366 --ref main
 
-# evaluate then DESTROY (frees the disk), or --keep to leave it running:
-python eval/vast_eval.py --ref <git-ref> --frontier 164 --ceiling 366 --destroy
+# stop after eval, or destroy (frees the disk):
+python eval/vast_eval.py --reuse <instance_id> --ref <git-ref> --frontier 164 --ceiling 366 --stop
+python eval/vast_eval.py --reuse <instance_id> --ref <git-ref> --frontier 164 --ceiling 366 --destroy
 ```
 
-**The instance is STOPPED after every eval by default** — compute billing pauses while the disk
-and cached weights (`/workspace/models`) persist, so the next `--reuse` run starts fast.
-`--keep` leaves it running; `--destroy` frees the disk too.
+**The instance is LEFT RUNNING after every eval by default** — pass `--stop` to pause billing while
+the disk and cached weights (`/workspace/models`) persist. `--destroy` frees the disk.
+Auto-rent is **off**; pass `--allow-provision` only if you want legacy destroy-and-recreate behavior.
 
 `--frontier` = current best tok/s for the scored target · `--ceiling` = roofline/reference display
 value. Reuse mode assumes the weights are cached at `/workspace/models`.
@@ -74,14 +75,14 @@ Set `SPARKINFER_EVAL_MODE=short` or pass `--eval-mode short` to keep the legacy 
 `--bidir` (or `BIDIR=1` / legacy `TRIPLE=1` in `.env.eval`) scores **both directions** in one build:
 
 ```
-build once ─► score_qwen35  Qwythos-9B : 128/4k/32k/64k speed + prefill pp ─► eval-qwen35:<LABEL>
+build once ─► score_qwen35  Qwythos-9B : 128/4k/32k/64k speed + prefill pp at 4k/32k/64k/128k ─► eval-qwen35:<LABEL>
            │              guard Qwen3.6  : 5 contexts ─► must NOT regress
-           └► score_qwen36  Qwen3.6      : 128/512/4k/16k/32k ─► eval-qwen36:<LABEL>
+           └► score_qwen36  Qwen3.6      : 128/512/4k/16k/32k decode + prefill pp at all 5 contexts ─► eval-qwen36:<LABEL>
                           guard Qwen3.5  : 128/512/4k ─► must NOT regress
 ```
 
 - **Qwen3.5** (Qwythos-9B) is measured at **128, 512, 4k only** — not 16k/32k.
-- **Qwen3.6** runs the full **5-context** sweep (128/512/4k/16k/32k).
+- **Qwen3.6** runs the full **5-context** decode sweep (128/512/4k/16k/32k) and **5-context prefill** pp at the same lengths.
 - Each direction gets its own label: `eval-qwen35:<tier>` and `eval-qwen36:<tier>`.
 - Headline `eval:<label>` is the best verified tier among passing directions.
 - Qwen3-30B is **no longer** part of the eval pipeline.
@@ -159,8 +160,8 @@ python eval/pr_eval_bot.py --instance 42134865 --dry-run                       #
 ```bash
 crontab -l 2>/dev/null; echo "0 */2 * * * $PWD/eval/run_bot_cron.sh >> /tmp/sparkinfer_bot.log 2>&1" | crontab -
 ```
-Each run: reuse the pinned instance if it survived, else provision fresh (Google Drive model) →
-evaluate new PR commits → **stop it again** → label + comment. Disable with `crontab -e`. Needs `gh` authenticated and the vast key saved (`vastai set api-key`).
+Each run: reuse the pinned `--reuse` instance → evaluate new PR commits → label + comment (instance
+stays running). Disable with `crontab -e`. Needs `gh` authenticated and a vast instance id (`VAST_INSTANCE`).
 
 **Dashboard merge-sync (no GPU).** The heavy eval cron may not run for hours, and `record_merge()`
 only used to fire for merged PRs that still had `merge-first`. Run `run_sync_cron.sh` every 15 min
