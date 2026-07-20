@@ -107,6 +107,17 @@ __device__ __forceinline__ float deq_q4k_val(const unsigned char* blk, int t) {
     int s, m; gg_scale_min_k4(2 * j64 + hi, sc, &s, &m);
     return d * s * nib - dmin * m;
 }
+__device__ __forceinline__ float deq_q5k_val(const unsigned char* blk, int t) {
+    const float d = gg_h2f(blk), dmin = gg_h2f(blk + 2);
+    const unsigned char* sc = blk + 4; const unsigned char* qh = blk + 16;
+    const unsigned char* ql = blk + 48;
+    const int j64 = t >> 6, r = t & 63, l = r & 31, hi = r >> 5;
+    const unsigned char byte = ql[j64 * 32 + l];
+    const int nib = hi ? (byte >> 4) : (byte & 0xF);
+    const int hbit = (qh[l] >> (2 * j64 + hi)) & 1;
+    int s, m; gg_scale_min_k4(2 * j64 + hi, sc, &s, &m);
+    return d * s * (nib + (hbit ? 16 : 0)) - dmin * m;
+}
 __device__ __forceinline__ float deq_q6k_val(const unsigned char* blk, int t) {
     const int half = t >> 7, r = t & 127, quad = r >> 5, l = r & 31;
     const unsigned char* ql = blk + half * 64;
@@ -122,11 +133,11 @@ __device__ __forceinline__ float deq_q6k_val(const unsigned char* blk, int t) {
     return d * sc[is + 2 * quad] * qv;
 }
 
-template <int QT>   // 12 = Q4_K (144B/superblock), 14 = Q6_K (210B/superblock)
+template <int QT>   // 12 = Q4_K (144B), 13 = Q5_K (176B), 14 = Q6_K (210B) per superblock
 __global__ void deq_rows_i8_kernel(const unsigned char* __restrict__ src,
                                    signed char* __restrict__ q, float* __restrict__ scale,
                                    int cols) {
-    constexpr int BS = (QT == 12) ? 144 : 210;
+    constexpr int BS = (QT == 12) ? 144 : (QT == 13) ? 176 : 210;
     const int row = blockIdx.x, t = threadIdx.x;
     const int nsb = cols >> 8;
     const unsigned char* rbase = src + (size_t)row * nsb * BS;
@@ -134,7 +145,8 @@ __global__ void deq_rows_i8_kernel(const unsigned char* __restrict__ src,
     float amax = 0.f;
     for (int sb = 0; sb < nsb; sb++) {
         const unsigned char* blk = rbase + (size_t)sb * BS;
-        const float v = (QT == 12) ? deq_q4k_val(blk, t) : deq_q6k_val(blk, t);
+        const float v = (QT == 12) ? deq_q4k_val(blk, t)
+                      : (QT == 13) ? deq_q5k_val(blk, t) : deq_q6k_val(blk, t);
         amax = fmaxf(amax, fabsf(v));
     }
     __shared__ float swarp[8];
@@ -156,7 +168,8 @@ __global__ void deq_rows_i8_kernel(const unsigned char* __restrict__ src,
     signed char* qrow = q + (size_t)row * cols;
     for (int sb = 0; sb < nsb; sb++) {
         const unsigned char* blk = rbase + (size_t)sb * BS;
-        const float v = (QT == 12) ? deq_q4k_val(blk, t) : deq_q6k_val(blk, t);
+        const float v = (QT == 12) ? deq_q4k_val(blk, t)
+                      : (QT == 13) ? deq_q5k_val(blk, t) : deq_q6k_val(blk, t);
         qrow[sb * 256 + t] = (signed char)(int)roundf(v * inv);
     }
 }
@@ -208,6 +221,7 @@ bool launch_gguf_dequant_rows_i8(int ggml_type, const void* src, signed char* q,
     if ((cols & 255) != 0) return false;
     auto* s = reinterpret_cast<const unsigned char*>(src);
     if (ggml_type == GGML_Q4_K)      deq_rows_i8_kernel<12><<<rows, 256, 0, stream>>>(s, q, scale, cols);
+    else if (ggml_type == GGML_Q5_K) deq_rows_i8_kernel<13><<<rows, 256, 0, stream>>>(s, q, scale, cols);
     else if (ggml_type == GGML_Q6_K) deq_rows_i8_kernel<14><<<rows, 256, 0, stream>>>(s, q, scale, cols);
     else return false;
     return true;

@@ -1120,6 +1120,9 @@ bool batched_prefill_enabled(bool gguf, const Qwen35Config& cfg, int n_tokens) {
         const char* mc = getenv("SPARKINFER_PREFILL_BATCHED_MAXCTX");
         batched_maxctx = mc ? atoi(mc) : 131072;
     }
+    // dense hybrid (Qwythos) or the Qwen3.6 MoE hybrid — prefill_batched_run validates the
+    // MoE requirements (256 experts, quantized experts + router) itself and returns -1 to
+    // fall back if unsupported.
     const bool ffn_ok = cfg.dense_ffn || cfg.n_experts > 0;
     return want_batched && gguf && cfg.hybrid && ffn_ok && n_tokens > 0 &&
            n_tokens <= batched_maxctx;
