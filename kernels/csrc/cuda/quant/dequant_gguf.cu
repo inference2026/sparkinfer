@@ -133,20 +133,23 @@ __device__ __forceinline__ float deq_q6k_val(const unsigned char* blk, int t) {
     return d * sc[is + 2 * quad] * qv;
 }
 
+// Single-pass Q→i8 for cols ≤ 2048 (Qwen3.6 MoE H/mffn). Wider rows (Qwythos
+// attn K=4096, FFN K=12288) keep the two-pass kernel so we never reject the i8
+// path (the previous cols>4096 early-return regressed Qwythos @4k prefill ~10%).
+static constexpr int kDeqRowsI8MaxNsb = 8;
+
 template <int QT>   // 12 = Q4_K (144B), 13 = Q5_K (176B), 14 = Q6_K (210B) per superblock
 __global__ void deq_rows_i8_kernel(const unsigned char* __restrict__ src,
                                    signed char* __restrict__ q, float* __restrict__ scale,
                                    int cols) {
-    // Single pass: dequant each of the `cols` values once into smem, reduce amax, then
-    // write int8. The previous two-pass form (amax scan then re-dequant) paid ~2x the
-    // Q4_K/Q5_K/Q6_K decode cost; MoE prefill calls this over E*mffn / E*H rows per layer.
+    // Single pass: dequant once into smem, reduce amax, then write int8.
+    // Avoids the old two-pass ~2x Q4_K/Q5_K/Q6_K decode cost. Cap cols at 2048
+    // (8 KB smem) so occupancy stays healthy on sm_120.
     constexpr int BS = (QT == 12) ? 144 : (QT == 13) ? 176 : 210;
     const int row = blockIdx.x, t = threadIdx.x;
     const int nsb = cols >> 8;
     const unsigned char* rbase = src + (size_t)row * nsb * BS;
 
-    // cols is a multiple of 256 and <= 4096 on every Qwen3.6 / Qwythos projection we feed
-    // through this path; 4096 floats = 16 KB shared — well under the sm_120 default.
     extern __shared__ float svals[];
     float amax = 0.f;
     for (int sb = 0; sb < nsb; sb++) {
@@ -175,6 +178,48 @@ __global__ void deq_rows_i8_kernel(const unsigned char* __restrict__ src,
     signed char* qrow = q + (size_t)row * cols;
     for (int sb = 0; sb < nsb; sb++)
         qrow[sb * 256 + t] = (signed char)(int)roundf(svals[sb * 256 + t] * inv);
+}
+
+// Two-pass fallback for cols > 2048 (Qwythos projections). Same math as above.
+template <int QT>
+__global__ void deq_rows_i8_twopass_kernel(const unsigned char* __restrict__ src,
+                                           signed char* __restrict__ q, float* __restrict__ scale,
+                                           int cols) {
+    constexpr int BS = (QT == 12) ? 144 : (QT == 13) ? 176 : 210;
+    const int row = blockIdx.x, t = threadIdx.x;
+    const int nsb = cols >> 8;
+    const unsigned char* rbase = src + (size_t)row * nsb * BS;
+
+    float amax = 0.f;
+    for (int sb = 0; sb < nsb; sb++) {
+        const unsigned char* blk = rbase + (size_t)sb * BS;
+        const float v = (QT == 12) ? deq_q4k_val(blk, t)
+                      : (QT == 13) ? deq_q5k_val(blk, t) : deq_q6k_val(blk, t);
+        amax = fmaxf(amax, fabsf(v));
+    }
+    __shared__ float swarp[8];
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    if ((t & 31) == 0) swarp[t >> 5] = amax;
+    __syncthreads();
+    if (t < 32) {
+        float v = (t < 8) ? swarp[t] : 0.f;
+        #pragma unroll
+        for (int o = 4; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+        if (t == 0) swarp[0] = v;
+    }
+    __syncthreads();
+    const float d = swarp[0] / 127.f;
+    if (t == 0) scale[row] = d;
+    const float inv = (d > 0.f) ? (1.f / d) : 0.f;
+
+    signed char* qrow = q + (size_t)row * cols;
+    for (int sb = 0; sb < nsb; sb++) {
+        const unsigned char* blk = rbase + (size_t)sb * BS;
+        const float v = (QT == 12) ? deq_q4k_val(blk, t)
+                      : (QT == 13) ? deq_q5k_val(blk, t) : deq_q6k_val(blk, t);
+        qrow[sb * 256 + t] = (signed char)(int)roundf(v * inv);
+    }
 }
 
 __global__ void deq_q8_0_kernel(const unsigned char* __restrict__ src, __nv_bfloat16* __restrict__ y, long nblocks) {
@@ -222,13 +267,21 @@ void launch_gguf_dequant(int ggml_type, const void* src, void* dst_bf16, long n_
 bool launch_gguf_dequant_rows_i8(int ggml_type, const void* src, signed char* q, float* scale,
                                  int rows, int cols, cudaStream_t stream) {
     if ((cols & 255) != 0) return false;
-    if (cols > 4096) return false;   // smem staging bound in deq_rows_i8_kernel
     auto* s = reinterpret_cast<const unsigned char*>(src);
-    const size_t smem = (size_t)cols * sizeof(float);
-    if (ggml_type == GGML_Q4_K)      deq_rows_i8_kernel<12><<<rows, 256, smem, stream>>>(s, q, scale, cols);
-    else if (ggml_type == GGML_Q5_K) deq_rows_i8_kernel<13><<<rows, 256, smem, stream>>>(s, q, scale, cols);
-    else if (ggml_type == GGML_Q6_K) deq_rows_i8_kernel<14><<<rows, 256, smem, stream>>>(s, q, scale, cols);
-    else return false;
+    const int nsb = cols >> 8;
+    if (nsb <= kDeqRowsI8MaxNsb) {
+        const size_t smem = (size_t)cols * sizeof(float);
+        if (ggml_type == GGML_Q4_K)      deq_rows_i8_kernel<12><<<rows, 256, smem, stream>>>(s, q, scale, cols);
+        else if (ggml_type == GGML_Q5_K) deq_rows_i8_kernel<13><<<rows, 256, smem, stream>>>(s, q, scale, cols);
+        else if (ggml_type == GGML_Q6_K) deq_rows_i8_kernel<14><<<rows, 256, smem, stream>>>(s, q, scale, cols);
+        else return false;
+    } else {
+        // Qwythos attn/FFN: keep two-pass so i8 GEMM still engages (do not return false).
+        if (ggml_type == GGML_Q4_K)      deq_rows_i8_twopass_kernel<12><<<rows, 256, 0, stream>>>(s, q, scale, cols);
+        else if (ggml_type == GGML_Q5_K) deq_rows_i8_twopass_kernel<13><<<rows, 256, 0, stream>>>(s, q, scale, cols);
+        else if (ggml_type == GGML_Q6_K) deq_rows_i8_twopass_kernel<14><<<rows, 256, 0, stream>>>(s, q, scale, cols);
+        else return false;
+    }
     return true;
 }
 
